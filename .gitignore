@@ -1,0 +1,14 @@
+# local working copies and build output
+backup/
+build/
+builddir/
+_build/
+*.o
+*.so
+*.a
+*~
+*.swp
+.vscode/
+.idea/
+compile_commands.json
+*.deb
