@@ -2,6 +2,7 @@
 #include <sys/stat.h>
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 #include "systray.h"
+#include "notifications.h"
 #include <gtk/gtkx.h>
 #include <gdk/gdkx.h>
 #include <X11/Xlib.h>
@@ -36,6 +37,10 @@ typedef struct {
     gint           pid;               /* owning process (SNI items), 0 if unknown */
     gboolean       is_network_applet; /* nm-applet & co. — hidden while the built-in Network item is on */
     gboolean       is_xembed;         /* legacy XEmbed icon (IBus etc.) living in a GtkSocket */
+    gboolean       xembed_dragged;    /* the press became a drag: don't forward the release */
+    GtkWidget     *ov_wrap, *ov_socket; /* its slot in the ▲ popup (XEmbed, while hidden) */
+    GtkWidget     *plug_in;           /* the socket that holds the app's icon window now */
+    gboolean       migrating;         /* moving between panel and popup: "removed" is not "quit" */
     GtkWidget     *socket;            /* the GtkSocket inside item->button (XEmbed only) */
     gulong         plug_xid;          /* embedded X window (XEmbed only) */
     GCancellable  *cancel;            /* cancels in-flight async D-Bus work when the item goes away */
@@ -54,6 +59,7 @@ struct _SystrayWidget {
     GtkWidget       *visible_box;
     GtkWidget       *xembed_box;
     GtkWidget       *xembed_Owner_win;
+    GtkWidget       *qs_btn, *qs_icons;   /* Quick Settings group button (one button, several icons) */
 
     /* Overflow */
     GtkWidget       *chevron_btn;
@@ -227,6 +233,14 @@ static void rebuild_settings_list_ui(SystrayWidget *tray);
 static gint compare_tray_items_by_saved_order(gconstpointer a, gconstpointer b);
 static void refresh_tray_item_properties(TrayItem *item);
 static void xembed_refresh_visibility(SystrayWidget *tray);
+static void xembed_place(TrayItem *item, gboolean in_popup, gint col, gint row, gint icon_px);
+static void qs_on_tray_click(SystrayWidget *t, GtkToggleButton *btn);
+static gboolean qs_enabled(SystrayWidget *t);
+static gboolean qs_is_member(SystrayWidget *t, TrayItem *it);
+static void qs_group_sync(SystrayWidget *t);
+static GdkWindow *xembed_shield_of(GtkWidget *wrap);
+static gboolean xembed_restore_shield(gpointer data);
+static gboolean on_xembed_plug_removed(GtkSocket *socket, gpointer user_data);
 static gchar *pa_cached_output(const gchar *cmd);
 static void pa_rebuild_app_items(SystrayWidget *tray);
 static void on_sni_getall_done(GObject *src, GAsyncResult *res, gpointer user_data);
@@ -1446,12 +1460,59 @@ static void save_tray_layout_to_xfconf(SystrayWidget *tray) {
     g_string_free(shown_str, TRUE);
 }
 
+/* an empty box still takes the box spacing on both sides - hide it then */
+static void tray_hide_empty_boxes(SystrayWidget *tray) {
+    {
+        GtkWidget *boxes[2] = { tray->visible_box, tray->xembed_box };
+        for (gint b = 0; b < 2; b++) {
+            if (!GTK_IS_CONTAINER(boxes[b])) continue;
+            gboolean any = FALSE;
+            GList *kids = gtk_container_get_children(GTK_CONTAINER(boxes[b]));
+            for (GList *k = kids; k && !any; k = k->next) any = gtk_widget_get_visible(k->data);
+            g_list_free(kids);
+            gtk_widget_set_visible(boxes[b], any);
+        }
+    }
+}
+
 static void relayout_tray_containers(SystrayWidget *tray) {
     if (!tray) return;
 
     gint icon_px = tray->shell ? CLAMP(tray->shell->tray_icon_size, 14, 28) : 16;
     gint spacing = tray->shell ? CLAMP(tray->shell->tray_icon_spacing, 0, 16) : 2;
     gboolean show_all = tray->shell ? tray->shell->tray_show_all : FALSE;
+
+    /* Status updates (power, network, audio, app icons) asked for this about once a second although
+       nothing about the layout had changed - and every pass takes all icons off the panel and puts
+       them back. Skip when everything the layout depends on is the same as last time. */
+    {
+        UltimateShell *sh = tray->shell;
+        GString *sig = g_string_new(NULL);
+        g_string_append_printf(sig, "qs%d%d|", sh ? sh->tray_quick_settings : 0, sh ? sh->tray_qs_bluetooth : 0);
+        g_string_append_printf(sig, "%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|", icon_px, spacing, show_all,
+            sh ? (gint)sh->mode : -1, sh ? sh->tray_enable_network : -1, sh ? sh->tray_enable_audio : -1,
+            sh ? sh->tray_enable_battery : -1, sh ? sh->tray_enable_clipboard : -1,
+            tray->bat_present, tray->mic_shown, network_applet_suppressed(tray), g_list_length(tray->all_items));
+        for (GList *l = tray->all_items; l; l = l->next) {
+            TrayItem *it = l->data;
+            if (!it) continue;
+            gboolean dup = it->is_xembed && sni_item_has_pid(tray, it->pid);
+            g_string_append_printf(sig, "%s:%d:%p:%d;", it->id ? it->id : "?", it->is_hidden, (void *)it->button, dup);
+        }
+        static gchar *last_sig = NULL;
+        if (last_sig && g_strcmp0(last_sig, sig->str) == 0) {
+            g_string_free(sig, TRUE);
+            /* a changed icon still gets the tray size (that part is cheap) */
+            for (GList *l = tray->all_items; l; l = l->next) {
+                TrayItem *it = l->data;
+                if (it && GTK_IS_IMAGE(it->image) && gtk_image_get_storage_type(GTK_IMAGE(it->image)) == GTK_IMAGE_ICON_NAME)
+                    gtk_image_set_pixel_size(GTK_IMAGE(it->image), icon_px);
+            }
+            return;
+        }
+        g_free(last_sig);
+        last_sig = g_string_free(sig, FALSE);
+    }
 
     gtk_box_set_spacing(GTK_BOX(tray->root_box), spacing);
     gtk_box_set_spacing(GTK_BOX(tray->visible_box), spacing);
@@ -1483,14 +1544,22 @@ static void relayout_tray_containers(SystrayWidget *tray) {
             (g_strcmp0(item->id, "builtin:battery") == 0 && !tray->bat_present) ||
             (g_strcmp0(item->id, "builtin:clipboard") == 0 && tray->shell && !tray->shell->tray_enable_clipboard) ||
             (g_strcmp0(item->id, "builtin:mic") == 0 && (!tray->mic_shown || (tray->shell && !tray->shell->tray_enable_audio))) ||
-            (item->is_network_applet && network_applet_suppressed(tray));
+            (item->is_network_applet && network_applet_suppressed(tray)) ||
+            qs_is_member(tray, item);                  /* lives in the Quick Settings group button */
 
         if (item->is_xembed) {
-            /* XEmbed icons always stay on the main panel; only their order changes. */
-            item->is_hidden = FALSE;
+            /* A hidden XEmbed icon lives in the ▲ popup like the others: its app window is moved
+               into a slot there (and back) only when hide / show changes. */
             if (!gtk_widget_get_parent(item->button)) {
                 gtk_box_pack_start(GTK_BOX(tray->visible_box), item->button, FALSE, FALSE, 0);
             }
+            if (GTK_IS_WIDGET(item->ov_socket)) gtk_widget_set_size_request(item->ov_socket, icon_px, icon_px);
+            if (GTK_IS_WIDGET(item->socket)) gtk_widget_set_size_request(item->socket, icon_px, icon_px);   /* follows Icon Size */
+            gboolean in_popup = item->is_hidden && !show_all && !disabled_builtin;
+            gint col = 0, row = 0;
+            if (in_popup) { col = h_idx % 5; row = h_idx / 5; h_idx++; }
+            xembed_place(item, in_popup, col, row, icon_px);
+            if (disabled_builtin) { gtk_widget_hide(item->button); if (item->ov_wrap) gtk_widget_hide(item->ov_wrap); }
             continue;
         }
 
@@ -1533,6 +1602,8 @@ static void relayout_tray_containers(SystrayWidget *tray) {
     }
 
     xembed_refresh_visibility(tray);
+    qs_group_sync(tray);
+    tray_hide_empty_boxes(tray);
 
     /* Respect the exact user-arranged order in tray->all_items 1:1 */
     gint pos_idx = 0;
@@ -1547,7 +1618,8 @@ static void relayout_tray_containers(SystrayWidget *tray) {
     if (!show_all) {
         for (GList *l = tray->all_items; l != NULL; l = l->next) {
             TrayItem *it = (TrayItem *)l->data;
-            if (!it->button || !it->is_hidden || it->is_xembed) continue;
+            if (!it->button || !it->is_hidden) continue;
+            if (qs_is_member(tray, it)) continue;          /* in Quick Settings, not in ▲ */
             if (g_strcmp0(it->id, "builtin:network") == 0 && tray->shell && !tray->shell->tray_enable_network) continue;
             if (g_strcmp0(it->id, "builtin:audio") == 0 && tray->shell && !tray->shell->tray_enable_audio) continue;
             if (g_strcmp0(it->id, "builtin:battery") == 0 && tray->shell && !tray->shell->tray_enable_battery) continue;
@@ -1636,7 +1708,6 @@ static void on_tray_item_drag_received(GtkWidget *dest_btn, GdkDragContext *ctx,
     g_free(src_id);
 
     if (src_item && src_item != dest_item) {
-        if (src_item->is_xembed && dest_item->is_hidden) { gtk_drag_finish(ctx, FALSE, FALSE, time); return; }
         src_item->is_hidden = dest_item->is_hidden;
         tray->all_items = g_list_remove(tray->all_items, src_item);
         gint dest_idx = g_list_index(tray->all_items, dest_item);
@@ -1661,7 +1732,7 @@ static void on_chevron_drag_received(GtkWidget *chev_btn, GdkDragContext *ctx, g
     TrayItem *src_item = find_tray_item_by_id(tray, src_id);
     g_free(src_id);
 
-    if (src_item && !src_item->is_xembed) {
+    if (src_item) {
         src_item->is_hidden = !src_item->is_hidden;
         save_tray_layout_to_xfconf(tray);
         relayout_tray_containers(tray);
@@ -1703,6 +1774,7 @@ static gboolean on_tray_item_motion(GtkWidget *btn, GdkEventMotion *ev, TrayItem
     gdouble dy = ABS(ev->y_root - g_tray_drag_start_y);
     if (!g_tray_drag_moved && dx < 6.0 && dy < 6.0) return FALSE;
     g_tray_drag_moved = TRUE;
+    if (item->is_xembed) item->xembed_dragged = TRUE;    /* its release must not click the app */
 
     SystrayWidget *tray = item->tray;
     /* Find which visible item (within the same group: app icons vs built-in icons) the cursor is over */
@@ -1777,16 +1849,18 @@ static gboolean on_tray_item_btn_release(GtkWidget *btn, GdkEventButton *ev, Tra
     return FALSE;
 }
 
-static void setup_tray_item_dnd(TrayItem *item) {
-    gtk_widget_add_events(item->button, GDK_BUTTON_PRESS_MASK | GDK_BUTTON_RELEASE_MASK |
+static void setup_tray_item_dnd_on(TrayItem *item, GtkWidget *w);
+static void setup_tray_item_dnd(TrayItem *item) { setup_tray_item_dnd_on(item, item->button); }
+static void setup_tray_item_dnd_on(TrayItem *item, GtkWidget *w) {
+    gtk_widget_add_events(w, GDK_BUTTON_PRESS_MASK | GDK_BUTTON_RELEASE_MASK |
                           GDK_BUTTON1_MOTION_MASK | GDK_POINTER_MOTION_MASK);
-    g_signal_connect(item->button, "button-press-event", G_CALLBACK(on_tray_item_btn_press), item);
-    g_signal_connect(item->button, "motion-notify-event", G_CALLBACK(on_tray_item_motion), item);
-    g_signal_connect(item->button, "button-release-event", G_CALLBACK(on_tray_item_btn_release), item);
+    g_signal_connect(w, "button-press-event", G_CALLBACK(on_tray_item_btn_press), item);
+    g_signal_connect(w, "motion-notify-event", G_CALLBACK(on_tray_item_motion), item);
+    g_signal_connect(w, "button-release-event", G_CALLBACK(on_tray_item_btn_release), item);
 
-    gtk_drag_dest_set(item->button, GTK_DEST_DEFAULT_ALL, tray_dnd_targets, G_N_ELEMENTS(tray_dnd_targets), GDK_ACTION_MOVE);
-    g_signal_connect(item->button, "drag-data-get", G_CALLBACK(on_tray_drag_data_get), item);
-    g_signal_connect(item->button, "drag-data-received", G_CALLBACK(on_tray_item_drag_received), item);
+    gtk_drag_dest_set(w, GTK_DEST_DEFAULT_ALL, tray_dnd_targets, G_N_ELEMENTS(tray_dnd_targets), GDK_ACTION_MOVE);
+    g_signal_connect(w, "drag-data-get", G_CALLBACK(on_tray_drag_data_get), item);
+    g_signal_connect(w, "drag-data-received", G_CALLBACK(on_tray_item_drag_received), item);
 }
 
 static void rebuild_clip_history_ui(SystrayWidget *tray);
@@ -2395,6 +2469,7 @@ static void power_setup(SystrayWidget *tray) {
 }
 
 static void on_bat_toggled(GtkToggleButton *btn, SystrayWidget *tray) {
+    if (qs_enabled(tray)) { if (gtk_toggle_button_get_active(btn)) qs_on_tray_click(tray, btn); return; }
     if (gtk_toggle_button_get_active(btn)) {
         if (g_pwr_upower) power_query_upower(tray); else { power_read_sysfs(&g_pwr); power_render(tray); }
         power_query_profile(tray);
@@ -3132,12 +3207,19 @@ static void refresh_network_popup_list(SystrayWidget *tray) {
     if (g_spawn_command_line_sync("nmcli -t -f NAME,TYPE,DEVICE connection show --active", &act_out, NULL, NULL, NULL) && act_out && act_out[0]) {
         gchar **lines = g_strsplit(act_out, "\n", -1);
         gchar *first = (lines && lines[0] && lines[0][0]) ? lines[0] : "Connected";
-        gchar *mk = g_markup_printf_escaped("<b>Active:</b> <span foreground='#1A73E8'>%s</span>", first);
+        /* "Wired connection 1:802-3-ethernet:enp0s3" → "Wired connection 1 · Ethernet" */
+        gchar **f = g_strsplit(first, ":", 3);
+        const gchar *kind = (f[0] && f[1]) ? (strstr(f[1], "ethernet") ? "Ethernet" : strstr(f[1], "wireless") ? "Wi-Fi" :
+                            strstr(f[1], "vpn") ? "VPN" : f[1]) : NULL;
+        gchar *nice = kind ? g_strdup_printf("%s · %s", f[0], kind) : g_strdup(first);
+        g_strfreev(f);
+        gchar *mk = g_markup_printf_escaped("<b>Connected:</b> %s", nice);
+        g_free(nice);
         gtk_label_set_markup(GTK_LABEL(tray->net_status_lbl), mk);
         g_free(mk);
         g_strfreev(lines);
     } else {
-        gtk_label_set_markup(GTK_LABEL(tray->net_status_lbl), "<b>Active:</b> Connected");
+        gtk_label_set_markup(GTK_LABEL(tray->net_status_lbl), "<b>Not connected</b>");
     }
     g_free(act_out);
 
@@ -3192,6 +3274,7 @@ static void on_net_settings_clicked(GtkButton *btn, SystrayWidget *tray) {
 }
 
 static void on_net_toggled(GtkToggleButton *btn, SystrayWidget *tray) {
+    if (qs_enabled(tray)) { if (gtk_toggle_button_get_active(btn)) qs_on_tray_click(tray, btn); return; }
     if (gtk_toggle_button_get_active(btn)) refresh_network_popup_list(tray);
     shell_toggle_popup_window(btn, tray->net_popup);
 }
@@ -3628,6 +3711,7 @@ static void ensure_menu_rgba_visual(GtkWidget *menu) {
 static void ap_toggle(SystrayWidget *tray, GtkToggleButton *btn);
 
 static void on_vol_toggled(GtkToggleButton *btn, SystrayWidget *tray) {
+    if (qs_enabled(tray)) { if (gtk_toggle_button_get_active(btn)) qs_on_tray_click(tray, btn); return; }
     /* new sound popup; the old menu below is kept only as a fallback */
     if (tray->vol_item && tray->vol_item->button) { ap_toggle(tray, btn); return; }
     ensure_menu_rgba_visual(tray->vol_menu);
@@ -3707,6 +3791,7 @@ typedef struct {
     gchar     *apps_sig;
     GHashTable *app_scales;           /* app name -> GtkScale */
     GtkWidget *dev_title, *dev_list;
+    GtkWidget *main_page, *dev_page, *foot, *foot_sep;   /* Quick Settings borrows the pages */
     gboolean   updating;
     guint      pos_timer, rebuild_id, name_sub, panel_icon_id;
 } AudioPopup;
@@ -3723,6 +3808,13 @@ struct _ApPlayer {
 };
 
 static AudioPopup *g_ap = NULL;
+static gboolean    g_ap_in_qs = FALSE;          /* its pages are in Quick Settings right now */
+static void qs_show_sound_devices(void);
+static void qs_back_to_main(void);
+static void ap_stack_show(AudioPopup *ap, const gchar *name) {
+    if (g_ap_in_qs) { if (g_strcmp0(name, "devices") == 0) qs_show_sound_devices(); else qs_back_to_main(); return; }
+    gtk_stack_set_visible_child_name(GTK_STACK(ap->stack), name);
+}
 static void ap_rebuild_players(AudioPopup *ap);
 
 /* ---------- small widgets ---------- */
@@ -3867,7 +3959,7 @@ static gboolean on_ap_out_scroll(GtkWidget *w, GdkEventScroll *ev, AudioPopup *a
 
 /* ---------- device chooser page ---------- */
 static void on_ap_back(GtkButton *b, AudioPopup *ap) {
-    gtk_stack_set_visible_child_name(GTK_STACK(ap->stack), "main");
+    ap_stack_show(ap, "main");
 }
 
 static gboolean ap_names_later(gpointer d) {
@@ -3931,7 +4023,7 @@ static void ap_show_devices(AudioPopup *ap, gboolean input) {
     }
     g_list_free_full(ch, free_port_choice);
     gtk_widget_show_all(ap->dev_list);
-    gtk_stack_set_visible_child_name(GTK_STACK(ap->stack), "devices");
+    ap_stack_show(ap, "devices");
 }
 static void on_ap_out_more(GtkButton *b, AudioPopup *ap) { ap_show_devices(ap, FALSE); }
 static void on_ap_in_more(GtkButton *b, AudioPopup *ap)  { ap_show_devices(ap, TRUE); }
@@ -4538,13 +4630,15 @@ static void on_ap_mpris_owner(GDBusConnection *c, const gchar *snd, const gchar 
 /* ---------- window ---------- */
 static void on_ap_settings(GtkButton *b, AudioPopup *ap) {
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ap->tray->vol_item->button), FALSE);
+    GtkWidget *top = gtk_widget_get_toplevel(GTK_WIDGET(b));
+    if (GTK_IS_WINDOW(top) && top != ap->win) shell_popup_hide(top);       /* opened from Quick Settings */
     if (ap->tray->shell && ap->tray->shell->plugin) g_signal_emit_by_name(ap->tray->shell->plugin, "configure-plugin");
 }
 static void on_ap_mixer(GtkButton *b, AudioPopup *ap) { on_open_pavucontrol(NULL, ap->tray); }
 
 static void on_ap_unmap(GtkWidget *w, AudioPopup *ap) {
     if (ap->pos_timer) { g_source_remove(ap->pos_timer); ap->pos_timer = 0; }
-    gtk_stack_set_visible_child_name(GTK_STACK(ap->stack), "main");
+    if (!g_ap_in_qs) gtk_stack_set_visible_child_name(GTK_STACK(ap->stack), "main");
 }
 
 static void ap_add_css(GtkWidget *win) {
@@ -4613,7 +4707,11 @@ static AudioPopup *ap_create(SystrayWidget *tray) {
     gtk_container_add(GTK_CONTAINER(pev), ap->players_stack);
     ap->dots_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
     gtk_widget_set_halign(ap->dots_box, GTK_ALIGN_CENTER);
-    gtk_box_pack_start(GTK_BOX(ap->players_frame), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), FALSE, FALSE, 2);
+    {
+        GtkWidget *psep = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL);
+        g_object_set_data(G_OBJECT(ap->players_frame), "players-sep", psep);   /* hidden in Quick Settings */
+        gtk_box_pack_start(GTK_BOX(ap->players_frame), psep, FALSE, FALSE, 2);
+    }
     gtk_box_pack_start(GTK_BOX(ap->players_frame), pev, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(ap->players_frame), ap->dots_box, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(main), ap->players_frame, FALSE, FALSE, 0);
@@ -4627,7 +4725,7 @@ static AudioPopup *ap_create(SystrayWidget *tray) {
     gtk_box_pack_start(GTK_BOX(main), ap->apps_exp, FALSE, FALSE, 0);
 
     GtkWidget *foot = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
-    GtkWidget *bset = gtk_button_new_with_label("Sound Settings…");
+    GtkWidget *bset = gtk_button_new_with_label("Shell Sound Settings…");
     GtkWidget *bmix = gtk_button_new_with_label("Mixer…");
     gtk_button_set_relief(GTK_BUTTON(bset), GTK_RELIEF_NONE);
     gtk_button_set_relief(GTK_BUTTON(bmix), GTK_RELIEF_NONE);
@@ -4635,8 +4733,10 @@ static AudioPopup *ap_create(SystrayWidget *tray) {
     g_signal_connect(bmix, "clicked", G_CALLBACK(on_ap_mixer), ap);
     gtk_box_pack_start(GTK_BOX(foot), bset, FALSE, FALSE, 0);
     gtk_box_pack_end(GTK_BOX(foot), bmix, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(main), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), FALSE, FALSE, 0);
+    ap->foot_sep = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL);
+    gtk_box_pack_start(GTK_BOX(main), ap->foot_sep, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(main), foot, FALSE, FALSE, 0);
+    ap->foot = foot;
 
     /* device page */
     GtkWidget *dev = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
@@ -4659,6 +4759,7 @@ static AudioPopup *ap_create(SystrayWidget *tray) {
 
     gtk_stack_add_named(GTK_STACK(ap->stack), main, "main");
     gtk_stack_add_named(GTK_STACK(ap->stack), dev, "devices");
+    ap->main_page = main; ap->dev_page = dev;
     gtk_container_add(GTK_CONTAINER(ap->win), ap->stack);
 
     if (tray->session_bus)
@@ -4669,8 +4770,10 @@ static AudioPopup *ap_create(SystrayWidget *tray) {
 }
 
 /* called after every PulseAudio refresh */
+static void qs_on_pa_state(SystrayWidget *t);
 static void ap_on_pa_state(SystrayWidget *tray) {
-    if (!g_ap || !g_ap->win || !gtk_widget_get_visible(g_ap->win)) return;
+    qs_on_pa_state(tray);
+    if (!g_ap || !g_ap->stack || !gtk_widget_get_mapped(g_ap->stack)) return;   /* own popup or Quick Settings */
     ap_sync_levels(g_ap);
     ap_sync_apps(g_ap);
 }
@@ -4702,9 +4805,671 @@ static void ap_toggle(SystrayWidget *tray, GtkToggleButton *btn) {
     }
 }
 
+/* =========================================================================
+ * Quick Settings (Windows 11 style)
+ *   [ media card - only while something plays ]
+ *   [ tiles, 3 columns: Network › · Bluetooth › · Airplane · Do Not Disturb · Dark · Night · Caffeine ]
+ *   [ brightness / volume › / microphone › ]
+ *   [ 🔋 94%                             ✎  ⚙ ]
+ * The detail pages behind › are the old popups' own content (network list, Bluetooth, sound devices &
+ * apps, power), moved in while the option is on and moved back when it is switched off.
+ * ========================================================================= */
+typedef struct {
+    SystrayWidget *tray;
+    GtkWidget *win, *stack, *main;
+    GtkWidget *media_card, *media_slot;
+    GtkWidget *net_tile, *net_icon, *net_lbl, *bt_cell, *bt_tile, *bt_lbl;
+    GtkWidget *dnd_tile, *dark_tile, *night_tile, *caf_tile, *air_tile;
+    GtkWidget *bright_row, *vol_btn, *mic_btn, *audio_slot, *grid, *cells[8];
+    gint       ncells;
+    GtkWidget *bat_btn, *bat_icon, *bat_lbl;
+    GtkWidget *sound_slot, *net_slot, *bt_slot, *bat_slot;
+    GtkWidget *net_content, *bt_content, *bat_content;
+    GtkWidget *players_home; gint players_pos;      /* where the players card lives in the sound popup */
+    gboolean   night_on, caf_on, updating;
+    gchar     *net_kind;                            /* "wifi", "ethernet" or NULL (disconnected) */
+} QuickSettings;
+static QuickSettings *g_qs = NULL;
+
+static void qs_sync_toggles(QuickSettings *q);
+static gboolean qs_enabled(SystrayWidget *t) { return t && t->shell && t->shell->tray_quick_settings; }
+
+static void qs_css(void) {
+    static GtkCssProvider *css = NULL;
+    if (css) return;
+    css = gtk_css_provider_new();
+    gtk_css_provider_load_from_data(css,
+        ".qs-card { background-color: alpha(@theme_fg_color, 0.05); border-radius: 8px; padding: 14px; }"
+        ".qs-tile { border-radius: 6px; background-color: alpha(@theme_fg_color, 0.09); border: 1px solid alpha(@theme_fg_color, 0.06); }"
+        ".qs-tile button { background: transparent; border: none; box-shadow: none; border-radius: 6px; min-height: 44px; padding: 0 6px; }"
+        ".qs-tile button:hover { background-color: alpha(@theme_fg_color, 0.07); }"
+        ".qs-tile .qs-split { border-left: 1px solid alpha(@theme_fg_color, 0.14); border-radius: 0 6px 6px 0; }"
+        ".qs-tile.qs-on { background-color: @theme_selected_bg_color; border-color: transparent; }"
+        ".qs-tile.qs-on image { color: @theme_selected_fg_color; }"
+        ".qs-tile.qs-on .qs-split { border-left-color: alpha(@theme_selected_fg_color, 0.30); }"
+        ".qs-name { font-size: smaller; }"
+        ".qs-foot button { min-width: 0; padding: 6px; }", -1, NULL);
+    gtk_style_context_add_provider_for_screen(gdk_screen_get_default(), GTK_STYLE_PROVIDER(css),
+                                              GTK_STYLE_PROVIDER_PRIORITY_USER + 120);
+}
+
+/* a tile with its name underneath; with more_cb it is split: [icon | ›] */
+static GtkWidget *qs_tile(QuickSettings *q, const gchar *icon, const gchar *name, GCallback cb, GCallback more_cb,
+                          GtkWidget **tile_out, GtkWidget **icon_out, GtkWidget **name_out) {
+    GtkWidget *cell = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    GtkWidget *tile = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_style_context_add_class(gtk_widget_get_style_context(tile), "qs-tile");
+    gtk_widget_set_size_request(tile, 96, -1);
+    GtkWidget *b = gtk_button_new();
+    gtk_button_set_relief(GTK_BUTTON(b), GTK_RELIEF_NONE);
+    GtkWidget *img = gtk_image_new_from_icon_name(icon, GTK_ICON_SIZE_MENU);
+    gtk_container_add(GTK_CONTAINER(b), img);
+    g_signal_connect(b, "clicked", cb, q);
+    gtk_box_pack_start(GTK_BOX(tile), b, TRUE, TRUE, 0);
+    if (more_cb) {
+        GtkWidget *m = gtk_button_new_from_icon_name("go-next-symbolic", GTK_ICON_SIZE_MENU);
+        gtk_button_set_relief(GTK_BUTTON(m), GTK_RELIEF_NONE);
+        gtk_style_context_add_class(gtk_widget_get_style_context(m), "qs-split");
+        g_signal_connect(m, "clicked", more_cb, q);
+        gtk_box_pack_start(GTK_BOX(tile), m, TRUE, TRUE, 0);
+    }
+    GtkWidget *lbl = gtk_label_new(name);
+    gtk_style_context_add_class(gtk_widget_get_style_context(lbl), "qs-name");
+    gtk_label_set_ellipsize(GTK_LABEL(lbl), PANGO_ELLIPSIZE_END);
+    gtk_label_set_max_width_chars(GTK_LABEL(lbl), 13);
+    gtk_box_pack_start(GTK_BOX(cell), tile, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(cell), lbl, FALSE, FALSE, 0);
+    if (tile_out) *tile_out = tile;
+    if (icon_out) *icon_out = img;
+    if (name_out) *name_out = lbl;
+    return cell;
+}
+static void qs_tile_set(GtkWidget *tile, gboolean on) {
+    if (!tile) return;
+    GtkStyleContext *c = gtk_widget_get_style_context(tile);
+    if (on) gtk_style_context_add_class(c, "qs-on"); else gtk_style_context_remove_class(c, "qs-on");
+}
+
+/* ---- network state: Wi-Fi, Ethernet or disconnected ---- */
+static gboolean qs_has_wifi_device(void) {
+    gchar *out = NULL; gboolean has = FALSE;
+    if (g_spawn_command_line_sync("nmcli -t -f TYPE dev", &out, NULL, NULL, NULL) && out) has = (strstr(out, "wifi") != NULL);
+    g_free(out);
+    return has;
+}
+static gboolean qs_wifi_enabled(void) {
+    gchar *out = NULL; gboolean on = FALSE;
+    if (g_spawn_command_line_sync("nmcli radio wifi", &out, NULL, NULL, NULL) && out) on = (strstr(out, "enabled") != NULL);
+    g_free(out);
+    return on;
+}
+/* the connection in use: name + kind */
+static gchar *qs_net_active(gchar **kind) {
+    gchar *out = NULL, *name = NULL;
+    *kind = NULL;
+    if (g_spawn_command_line_sync("nmcli -t -f TYPE,STATE,CONNECTION dev", &out, NULL, NULL, NULL) && out) {
+        gchar **ln = g_strsplit(out, "\n", -1);
+        for (gint pass = 0; pass < 2 && !name; pass++)          /* Wi-Fi first, then Ethernet */
+            for (gint i = 0; ln[i] && !name; i++) {
+                gchar **f = g_strsplit(ln[i], ":", 3);
+                if (f[0] && f[1] && f[2] && g_str_has_prefix(f[1], "connected") &&
+                    g_strcmp0(f[0], pass == 0 ? "wifi" : "ethernet") == 0) {
+                    name = g_strdup(f[2]); *kind = g_strdup(f[0]);
+                }
+                g_strfreev(f);
+            }
+        g_strfreev(ln);
+    }
+    g_free(out);
+    return name;
+}
+static gboolean qs_airplane_on(void) {
+    gchar *out = NULL; gboolean off = FALSE;
+    if (g_spawn_command_line_sync("nmcli radio all", &out, NULL, NULL, NULL) && out) off = (strstr(out, "enabled") == NULL);
+    g_free(out);
+    return off;
+}
+
+static void qs_set_night_light(gboolean on) {
+    const gchar *g = on ? "1:0.86:0.72" : "1:1:1";
+    /* every connected output; run through sh with argv, so no extra quoting is needed */
+    gchar *script = g_strdup_printf("for o in $(xrandr | awk '/ connected/{print $1}'); do xrandr --output \"$o\" --gamma %s; done", g);
+    gchar *argv[] = { "sh", "-c", script, NULL };
+    g_spawn_async(NULL, argv, NULL, G_SPAWN_SEARCH_PATH, NULL, NULL, NULL, NULL);
+    g_free(script);
+}
+static void qs_set_caffeine(gboolean on) {
+    XfconfChannel *pm = xfconf_channel_get("xfce4-power-manager");
+    if (pm) xfconf_channel_set_bool(pm, "/xfce4-power-manager/presentation-mode", on);
+    g_spawn_command_line_async(on ? "xset s off -dpms" : "xset s on +dpms", NULL);
+}
+
+
+static void qs_sync_toggles(QuickSettings *q) {
+    ShellPalette p; shell_palette_get(q->tray->shell, &p);
+    qs_tile_set(q->dnd_tile, notifications_get_dnd());
+    qs_tile_set(q->dark_tile, p.dark);
+    qs_tile_set(q->night_tile, q->night_on);
+    XfconfChannel *pm = xfconf_channel_get("xfce4-power-manager");
+    if (pm) q->caf_on = xfconf_channel_get_bool(pm, "/xfce4-power-manager/presentation-mode", q->caf_on);
+    qs_tile_set(q->caf_tile, q->caf_on);
+    qs_tile_set(q->air_tile, qs_airplane_on());
+}
+
+static void qs_sync(QuickSettings *q) {
+    SystrayWidget *t = q->tray;
+    q->updating = TRUE;
+    /* network tile */
+    gchar *kind = NULL, *name = qs_net_active(&kind);
+    g_free(q->net_kind); q->net_kind = kind;
+    gboolean has_wifi = qs_has_wifi_device();
+    gboolean on = kind != NULL || (has_wifi && qs_wifi_enabled());
+    qs_tile_set(q->net_tile, on);
+    const gchar *icon = !kind ? (has_wifi ? "network-wireless-offline-symbolic" : "network-offline-symbolic")
+                      : g_strcmp0(kind, "wifi") == 0 ? "network-wireless-symbolic" : "network-wired-symbolic";
+    gtk_image_set_from_icon_name(GTK_IMAGE(q->net_icon), icon, GTK_ICON_SIZE_MENU);
+    gtk_label_set_text(GTK_LABEL(q->net_lbl), name ? name : (has_wifi && qs_wifi_enabled() ? "Available" : "Disconnected"));
+    gtk_widget_set_tooltip_text(q->net_lbl, name);
+    g_free(name);
+    /* Bluetooth tile only when there is an adapter */
+    gboolean has_bt = GTK_IS_SWITCH(t->bt_power_sw) && t->bt_adapter_path;
+    gtk_widget_set_visible(q->bt_cell, has_bt);
+    /* tiles flow on: a missing one (Bluetooth) leaves no gap */
+    {
+        for (gint i = 0; i < q->ncells; i++)
+            if (gtk_widget_get_parent(q->cells[i]) == q->grid) {
+                g_object_ref(q->cells[i]);
+                gtk_container_remove(GTK_CONTAINER(q->grid), q->cells[i]);
+            } else g_object_ref(q->cells[i]);
+        gint k = 0;
+        for (gint i = 0; i < q->ncells; i++) {
+            if (q->cells[i] != q->bt_cell || has_bt) { gtk_grid_attach(GTK_GRID(q->grid), q->cells[i], k % 3, k / 3, 1, 1); k++; }
+            else gtk_grid_attach(GTK_GRID(q->grid), q->cells[i], 0, 99, 1, 1);   /* parked, hidden */
+            g_object_unref(q->cells[i]);
+        }
+    }
+    if (has_bt) {
+        gboolean bon = gtk_switch_get_active(GTK_SWITCH(t->bt_power_sw));
+        qs_tile_set(q->bt_tile, bon);
+        gtk_label_set_text(GTK_LABEL(q->bt_lbl), bon ? "Bluetooth" : "Bluetooth off");
+    }
+    qs_sync_toggles(q);
+    /* sliders, battery */
+    if (q->bright_row) gtk_widget_set_visible(q->bright_row, t->pwr_backlight != NULL);
+    gtk_widget_set_visible(q->bat_btn, g_pwr.has_battery);
+    if (g_pwr.has_battery) {
+        gchar *tx = g_strdup_printf("%.0f%%", g_pwr.percent);
+        gtk_label_set_text(GTK_LABEL(q->bat_lbl), tx);
+        g_free(tx);
+        const gchar *bi = g_pwr.state == PWR_STATE_CHARGING || g_pwr.state == PWR_STATE_FULL ? "battery-full-charging-symbolic"
+                        : g_pwr.percent < 15 ? "battery-caution-symbolic" : g_pwr.percent < 50 ? "battery-low-symbolic" : "battery-good-symbolic";
+        gtk_image_set_from_icon_name(GTK_IMAGE(q->bat_icon), bi, GTK_ICON_SIZE_MENU);
+        gint64 secs = g_pwr.state == PWR_STATE_CHARGING ? g_pwr.secs_to_full : g_pwr.state == PWR_STATE_DISCHARGING ? g_pwr.secs_to_empty : 0;
+        gchar *tip = secs > 60 ? g_strdup_printf(g_pwr.state == PWR_STATE_CHARGING ? "%d:%02d until full" : "%d:%02d left",
+                                                 (gint)(secs / 3600), (gint)(secs / 60 % 60))
+                               : g_strdup(g_pwr.state == PWR_STATE_FULL ? "Fully charged" : "Battery & power modes");
+        gtk_widget_set_tooltip_text(q->bat_btn, tip);
+        g_free(tip);
+    }
+    /* the media card only while there is a player */
+    if (g_ap && g_ap->players_stack) {
+        GList *kids = gtk_container_get_children(GTK_CONTAINER(g_ap->players_stack));
+        gtk_widget_set_visible(q->media_card, kids != NULL);
+        g_list_free(kids);
+    } else gtk_widget_set_visible(q->media_card, FALSE);
+    q->updating = FALSE;
+}
+
+/* ---- actions ---- */
+static gboolean qs_sync_later(gpointer d) { if (g_qs) qs_sync(g_qs); return G_SOURCE_REMOVE; }
+static void on_qs_net(GtkButton *b, QuickSettings *q) {
+    if (qs_has_wifi_device()) {
+        gboolean on = !qs_wifi_enabled();
+        g_spawn_command_line_async(on ? "nmcli radio wifi on" : "nmcli radio wifi off", NULL);
+        qs_tile_set(q->net_tile, on);
+    } else {                                   /* wired only: networking on / off */
+        gboolean on = q->net_kind == NULL;
+        g_spawn_command_line_async(on ? "nmcli networking on" : "nmcli networking off", NULL);
+        qs_tile_set(q->net_tile, on);
+    }
+    g_timeout_add(1500, qs_sync_later, NULL);
+}
+static void on_qs_bt(GtkButton *b, QuickSettings *q) {
+    SystrayWidget *t = q->tray;
+    if (!GTK_IS_SWITCH(t->bt_power_sw)) return;
+    gboolean on = !gtk_switch_get_active(GTK_SWITCH(t->bt_power_sw));
+    gtk_switch_set_active(GTK_SWITCH(t->bt_power_sw), on);
+    qs_tile_set(q->bt_tile, on);
+    g_timeout_add(1200, qs_sync_later, NULL);
+}
+static void on_qs_dnd(GtkButton *b, QuickSettings *q) { notifications_set_dnd(!notifications_get_dnd()); qs_sync_toggles(q); }
+static void on_qs_dark(GtkButton *b, QuickSettings *q) {
+    ShellPalette p; shell_palette_get(q->tray->shell, &p);
+    shell_set_dark_mode(q->tray->shell, !p.dark);
+    qs_sync_toggles(q);
+}
+static void on_qs_night(GtkButton *b, QuickSettings *q) { q->night_on = !q->night_on; qs_set_night_light(q->night_on); qs_sync_toggles(q); }
+static void on_qs_caffeine(GtkButton *b, QuickSettings *q) { q->caf_on = !q->caf_on; qs_set_caffeine(q->caf_on); qs_tile_set(q->caf_tile, q->caf_on); }
+static void on_qs_airplane(GtkButton *b, QuickSettings *q) {
+    gboolean on = !qs_airplane_on();
+    g_spawn_command_line_async(on ? "nmcli radio all off" : "nmcli radio all on", NULL);
+    SystrayWidget *t = q->tray;
+    if (GTK_IS_SWITCH(t->bt_power_sw) && t->bt_adapter_path) gtk_switch_set_active(GTK_SWITCH(t->bt_power_sw), !on);
+    qs_tile_set(q->air_tile, on);
+    g_timeout_add(1500, qs_sync_later, NULL);
+}
+
+static void qs_stop_bt_scan(SystrayWidget *t) {
+    if (t->bt_scanning && t->sys_bus && t->bt_adapter_path) {
+        g_dbus_connection_call(t->sys_bus, "org.bluez", t->bt_adapter_path, "org.bluez.Adapter1", "StopDiscovery",
+                               NULL, NULL, G_DBUS_CALL_FLAGS_NONE, 3000, NULL, NULL, NULL);
+        t->bt_scanning = FALSE;
+    }
+}
+/* a detail page takes exactly the main page's size (no shrinking / growing; long lists scroll) */
+static void qs_show_page(QuickSettings *q, const gchar *name) {
+    GtkWidget *pg = gtk_stack_get_child_by_name(GTK_STACK(q->stack), name);
+    if (!pg) return;
+    /* lock the whole panel at the main page's size while a detail page shows */
+    if (!g_strcmp0(gtk_stack_get_visible_child_name(GTK_STACK(q->stack)), "main")) {
+        gint w = gtk_widget_get_allocated_width(q->stack), h = gtk_widget_get_allocated_height(q->stack);
+        if (w > 1 && h > 1) gtk_widget_set_size_request(q->stack, w, h);
+    }
+    gtk_widget_set_vexpand(pg, TRUE);
+    gtk_stack_set_visible_child(GTK_STACK(q->stack), pg);
+}
+static void qs_show_sound_devices(void) { if (g_qs) qs_show_page(g_qs, "sound"); }
+static void qs_back_to_main(void) { if (g_qs) { gtk_stack_set_visible_child_name(GTK_STACK(g_qs->stack), "main"); gtk_widget_set_size_request(g_qs->stack, -1, -1); } }
+static void on_qs_net_more(GtkButton *b, QuickSettings *q) { refresh_network_popup_list(q->tray); qs_show_page(q, "net"); }
+static void on_qs_bt_more(GtkButton *b, QuickSettings *q) { qs_show_page(q, "bt"); refresh_bluetooth_ui(q->tray); }
+static void on_qs_power_more(GtkButton *b, QuickSettings *q) {
+    power_query_profile(q->tray);
+    pwr_sync_brightness_slider(q->tray);
+    qs_show_page(q, "power");
+}
+static void on_qs_back(GtkButton *b, QuickSettings *q) {
+    qs_stop_bt_scan(q->tray);
+    gtk_stack_set_visible_child_name(GTK_STACK(q->stack), "main");
+    gtk_widget_set_size_request(q->stack, -1, -1);
+    qs_sync(q);
+}
+static void on_qs_system_settings(GtkButton *b, QuickSettings *q) { shell_popup_hide(q->win); g_spawn_command_line_async("xfce4-settings-manager", NULL); }
+static void on_qs_shell_settings(GtkButton *b, QuickSettings *q) {
+    shell_popup_hide(q->win);
+    if (q->tray->shell && q->tray->shell->plugin) g_signal_emit_by_name(q->tray->shell->plugin, "configure-plugin");
+}
+static void on_qs_unmap(GtkWidget *w, QuickSettings *q) {
+    qs_stop_bt_scan(q->tray);
+    gtk_stack_set_visible_child_name(GTK_STACK(q->stack), "main");
+    gtk_widget_set_size_request(q->stack, -1, -1);
+    if (g_ap && g_ap->pos_timer) { g_source_remove(g_ap->pos_timer); g_ap->pos_timer = 0; }
+}
+
+static void qs_move(GtkWidget *w, GtkWidget *to) {
+    if (!GTK_IS_WIDGET(w) || !GTK_IS_CONTAINER(to)) return;
+    GtkWidget *p = gtk_widget_get_parent(w);
+    if (p == to) return;
+    g_object_ref(w);
+    if (p) gtk_container_remove(GTK_CONTAINER(p), w);
+    gtk_container_add(GTK_CONTAINER(to), w);
+    if (GTK_IS_BOX(to))   /* fill the page, so its list uses all the height instead of a small scroll */
+        gtk_box_set_child_packing(GTK_BOX(to), w, TRUE, TRUE, 0, GTK_PACK_START);
+    g_object_unref(w);
+}
+
+static GtkWidget *qs_page(QuickSettings *q, const gchar *title, GtkWidget **slot) {
+    GtkWidget *pg = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+    gtk_style_context_add_class(gtk_widget_get_style_context(pg), "qs-card");
+    g_object_set(pg, "margin", 10, NULL);
+    GtkWidget *hdr = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    gtk_container_set_border_width(GTK_CONTAINER(hdr), 8);
+    GtkWidget *back = gtk_button_new_from_icon_name("go-previous-symbolic", GTK_ICON_SIZE_MENU);
+    gtk_button_set_relief(GTK_BUTTON(back), GTK_RELIEF_NONE);
+    g_signal_connect(back, "clicked", G_CALLBACK(on_qs_back), q);
+    GtkWidget *tl = gtk_label_new(NULL);
+    gchar *mk = g_markup_printf_escaped("<b>%s</b>", title);
+    gtk_label_set_markup(GTK_LABEL(tl), mk);
+    g_free(mk);
+    gtk_box_pack_start(GTK_BOX(hdr), back, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(hdr), tl, FALSE, FALSE, 0);
+    *slot = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_box_pack_start(GTK_BOX(pg), hdr, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(pg), *slot, TRUE, TRUE, 0);
+    return pg;
+}
+
+/* one slider row: [icon button] ━━━○━━ [›] - the scale shares the sound popup's / power popup's adjustment */
+static GtkWidget *qs_slider_row(GtkAdjustment *adj, const gchar *icon, GtkWidget **icon_btn, GCallback icon_cb,
+                                GCallback more_cb, QuickSettings *q) {
+    GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    GtkWidget *ib = gtk_button_new_from_icon_name(icon, GTK_ICON_SIZE_MENU);
+    gtk_button_set_relief(GTK_BUTTON(ib), GTK_RELIEF_NONE);
+    if (icon_cb) g_signal_connect(ib, "clicked", icon_cb, q); else gtk_widget_set_sensitive(ib, FALSE);
+    GtkWidget *sc = gtk_scale_new(GTK_ORIENTATION_HORIZONTAL, adj);
+    gtk_scale_set_draw_value(GTK_SCALE(sc), FALSE);
+    gtk_box_pack_start(GTK_BOX(row), ib, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(row), sc, TRUE, TRUE, 0);
+    if (more_cb) {
+        GtkWidget *m = gtk_button_new_from_icon_name("go-next-symbolic", GTK_ICON_SIZE_MENU);
+        gtk_button_set_relief(GTK_BUTTON(m), GTK_RELIEF_NONE);
+        gtk_widget_set_tooltip_text(m, "Devices and apps");
+        g_signal_connect(m, "clicked", more_cb, q);
+        gtk_box_pack_start(GTK_BOX(row), m, FALSE, FALSE, 0);
+    }
+    if (icon_btn) *icon_btn = ib;
+    return row;
+}
+
+static QuickSettings *qs_create(SystrayWidget *t, GtkWidget *anchor) {
+    qs_css();
+    QuickSettings *q = g_new0(QuickSettings, 1);
+    q->tray = t;
+    if (!g_ap && t->vol_item && t->vol_item->button) g_ap = ap_create(t);
+    q->win = shell_create_popup_window(anchor, 360, -1, FALSE);
+    g_object_set_data(G_OBJECT(q->win), "center-on-button", GINT_TO_POINTER(1));
+    g_signal_connect(q->win, "unmap", G_CALLBACK(on_qs_unmap), q);
+    q->stack = gtk_stack_new();
+    gtk_stack_set_transition_type(GTK_STACK(q->stack), GTK_STACK_TRANSITION_TYPE_SLIDE_LEFT_RIGHT);
+    gtk_stack_set_transition_duration(GTK_STACK(q->stack), (guint)shell_anim_ms(180));
+    gtk_stack_set_vhomogeneous(GTK_STACK(q->stack), FALSE);
+    gtk_stack_set_interpolate_size(GTK_STACK(q->stack), TRUE);
+
+    q->main = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+    gtk_container_set_border_width(GTK_CONTAINER(q->main), 10);
+
+    /* 1. media card */
+    q->media_card = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    q->media_slot = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_container_add(GTK_CONTAINER(q->media_card), q->media_slot);
+    gtk_widget_set_no_show_all(q->media_card, TRUE);
+    gtk_widget_show(q->media_slot);
+    gtk_box_pack_start(GTK_BOX(q->main), q->media_card, FALSE, FALSE, 0);
+
+    /* 2. tiles + sliders */
+    GtkWidget *card = gtk_box_new(GTK_ORIENTATION_VERTICAL, 22);
+    gtk_style_context_add_class(gtk_widget_get_style_context(card), "qs-card");
+    GtkWidget *grid = gtk_grid_new();
+    gtk_grid_set_column_spacing(GTK_GRID(grid), 10);
+    gtk_grid_set_row_spacing(GTK_GRID(grid), 12);
+    gtk_grid_set_column_homogeneous(GTK_GRID(grid), TRUE);
+    GtkWidget *cells[7];
+    gint n = 0;
+    cells[n++] = qs_tile(q, "network-wireless-symbolic", "Network", G_CALLBACK(on_qs_net), G_CALLBACK(on_qs_net_more), &q->net_tile, &q->net_icon, &q->net_lbl);
+    q->bt_cell = qs_tile(q, "bluetooth-active-symbolic", "Bluetooth", G_CALLBACK(on_qs_bt), G_CALLBACK(on_qs_bt_more), &q->bt_tile, NULL, &q->bt_lbl);
+    cells[n++] = q->bt_cell;
+    cells[n++] = qs_tile(q, "airplane-mode-symbolic", "Airplane mode", G_CALLBACK(on_qs_airplane), NULL, &q->air_tile, NULL, NULL);
+    cells[n++] = qs_tile(q, "notifications-disabled-symbolic", "Do not disturb", G_CALLBACK(on_qs_dnd), NULL, &q->dnd_tile, NULL, NULL);
+    cells[n++] = qs_tile(q, "weather-clear-night-symbolic", "Dark mode", G_CALLBACK(on_qs_dark), NULL, &q->dark_tile, NULL, NULL);
+    cells[n++] = qs_tile(q, "night-light-symbolic", "Night light", G_CALLBACK(on_qs_night), NULL, &q->night_tile, NULL, NULL);
+    cells[n++] = qs_tile(q, "preferences-desktop-screensaver-symbolic", "Caffeine", G_CALLBACK(on_qs_caffeine), NULL, &q->caf_tile, NULL, NULL);
+    for (gint i = 0; i < n; i++) { q->cells[i] = cells[i]; gtk_widget_show_all(cells[i]); }
+    q->ncells = n;
+    q->grid = grid;
+    gtk_widget_set_no_show_all(q->bt_cell, TRUE);
+    gtk_box_pack_start(GTK_BOX(card), grid, FALSE, FALSE, 0);
+
+    GtkWidget *sliders = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+    if (GTK_IS_RANGE(t->pwr_bright_scale)) {
+        q->bright_row = qs_slider_row(gtk_range_get_adjustment(GTK_RANGE(t->pwr_bright_scale)),
+                                      "display-brightness-symbolic", NULL, NULL, NULL, q);
+        gtk_box_pack_start(GTK_BOX(sliders), q->bright_row, FALSE, FALSE, 0);
+    }
+    /* volume + microphone: the sound popup's own rows (names, %, › device lists) */
+    q->audio_slot = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_box_pack_start(GTK_BOX(sliders), q->audio_slot, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(card), sliders, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(q->main), card, FALSE, FALSE, 0);
+
+    /* 3. footer: battery (→ Power) · Ultimate Shell settings · system settings */
+    GtkWidget *foot = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+    gtk_style_context_add_class(gtk_widget_get_style_context(foot), "qs-foot");
+    q->bat_btn = gtk_button_new();
+    gtk_button_set_relief(GTK_BUTTON(q->bat_btn), GTK_RELIEF_NONE);
+    GtkWidget *bb = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    q->bat_icon = gtk_image_new_from_icon_name("battery-good-symbolic", GTK_ICON_SIZE_MENU);
+    q->bat_lbl = gtk_label_new("");
+    gtk_box_pack_start(GTK_BOX(bb), q->bat_icon, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(bb), q->bat_lbl, FALSE, FALSE, 0);
+    gtk_container_add(GTK_CONTAINER(q->bat_btn), bb);
+    g_signal_connect(q->bat_btn, "clicked", G_CALLBACK(on_qs_power_more), q);
+    gtk_widget_set_no_show_all(q->bat_btn, TRUE);
+    gtk_widget_show_all(bb);
+    GtkWidget *bsh = gtk_button_new_from_icon_name("document-edit-symbolic", GTK_ICON_SIZE_MENU);
+    gtk_widget_set_tooltip_text(bsh, "Ultimate Shell Settings");
+    GtkWidget *bsys = gtk_button_new_from_icon_name("emblem-system-symbolic", GTK_ICON_SIZE_MENU);
+    gtk_widget_set_tooltip_text(bsys, "System Settings");
+    gtk_button_set_relief(GTK_BUTTON(bsh), GTK_RELIEF_NONE);
+    gtk_button_set_relief(GTK_BUTTON(bsys), GTK_RELIEF_NONE);
+    g_signal_connect(bsh, "clicked", G_CALLBACK(on_qs_shell_settings), q);
+    g_signal_connect(bsys, "clicked", G_CALLBACK(on_qs_system_settings), q);
+    gtk_box_pack_start(GTK_BOX(foot), q->bat_btn, FALSE, FALSE, 0);
+    gtk_box_pack_end(GTK_BOX(foot), bsys, FALSE, FALSE, 0);
+    gtk_box_pack_end(GTK_BOX(foot), bsh, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(q->main), foot, FALSE, FALSE, 0);
+
+    gtk_stack_add_named(GTK_STACK(q->stack), q->main, "main");
+    gtk_stack_add_named(GTK_STACK(q->stack), qs_page(q, "Network", &q->net_slot), "net");
+    gtk_stack_add_named(GTK_STACK(q->stack), qs_page(q, "Bluetooth", &q->bt_slot), "bt");
+    q->sound_slot = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_style_context_add_class(gtk_widget_get_style_context(q->sound_slot), "qs-card");
+    g_object_set(q->sound_slot, "margin", 10, NULL);
+    gtk_stack_add_named(GTK_STACK(q->stack), q->sound_slot, "sound");
+    gtk_stack_add_named(GTK_STACK(q->stack), qs_page(q, "Power", &q->bat_slot), "power");
+    gtk_container_add(GTK_CONTAINER(q->win), q->stack);
+    return q;
+}
+
+/* borrow the detail content (and the players card) from the old popups */
+static void qs_adopt(QuickSettings *q) {
+    SystrayWidget *t = q->tray;
+    if (g_ap) {
+        g_ap_in_qs = TRUE;
+        qs_move(g_ap->main_page, q->audio_slot);
+        qs_move(g_ap->dev_page, q->sound_slot);
+        gtk_container_set_border_width(GTK_CONTAINER(g_ap->main_page), 0);
+        gtk_widget_set_size_request(g_ap->main_page, -1, -1);
+        if (gtk_widget_get_parent(g_ap->players_frame) != q->media_slot) {
+            q->players_home = gtk_widget_get_parent(g_ap->players_frame);
+            GValue v = G_VALUE_INIT; g_value_init(&v, G_TYPE_INT);
+            gtk_container_child_get_property(GTK_CONTAINER(q->players_home), g_ap->players_frame, "position", &v);
+            q->players_pos = g_value_get_int(&v);
+            qs_move(g_ap->players_frame, q->media_slot);
+        }
+        GtkWidget *psep = g_object_get_data(G_OBJECT(g_ap->players_frame), "players-sep");
+        if (psep) { gtk_widget_set_no_show_all(psep, TRUE); gtk_widget_hide(psep); }
+    }
+    if (!q->net_content && t->net_popup) q->net_content = gtk_bin_get_child(GTK_BIN(t->net_popup));
+    if (q->net_content) qs_move(q->net_content, q->net_slot);
+    if (!q->bt_content && t->bt_popup) q->bt_content = gtk_bin_get_child(GTK_BIN(t->bt_popup));
+    if (q->bt_content) qs_move(q->bt_content, q->bt_slot);
+    if (!q->bat_content && t->bat_popup) q->bat_content = gtk_bin_get_child(GTK_BIN(t->bat_popup));
+    if (q->bat_content) qs_move(q->bat_content, q->bat_slot);
+}
+static void qs_return(QuickSettings *q) {
+    SystrayWidget *t = q->tray;
+    if (g_ap) {
+        if (q->players_home && gtk_widget_get_parent(g_ap->players_frame) != q->players_home) {
+            qs_move(g_ap->players_frame, q->players_home);
+            gtk_box_reorder_child(GTK_BOX(q->players_home), g_ap->players_frame, q->players_pos);
+        }
+        GtkWidget *psep = g_object_get_data(G_OBJECT(g_ap->players_frame), "players-sep");
+        if (psep) { gtk_widget_set_no_show_all(psep, FALSE); gtk_widget_show(psep); }
+        GtkWidget *pages[2] = { g_ap->main_page, g_ap->dev_page };
+        const gchar *names[2] = { "main", "devices" };
+        for (gint i = 0; i < 2; i++) {
+            g_object_ref(pages[i]);
+            if (gtk_widget_get_parent(pages[i])) gtk_container_remove(GTK_CONTAINER(gtk_widget_get_parent(pages[i])), pages[i]);
+            gtk_stack_add_named(GTK_STACK(g_ap->stack), pages[i], names[i]);
+            g_object_unref(pages[i]);
+        }
+        gtk_container_set_border_width(GTK_CONTAINER(g_ap->main_page), 12);
+        gtk_widget_set_size_request(g_ap->main_page, 380, -1);
+        gtk_widget_set_no_show_all(g_ap->foot, FALSE); gtk_widget_show(g_ap->foot);
+        gtk_widget_set_no_show_all(g_ap->foot_sep, FALSE); gtk_widget_show(g_ap->foot_sep);
+        g_ap_in_qs = FALSE;
+    }
+    if (q->net_content && t->net_popup) qs_move(q->net_content, t->net_popup);
+    if (q->bt_content && t->bt_popup) qs_move(q->bt_content, t->bt_popup);
+    if (q->bat_content && t->bat_popup) qs_move(q->bat_content, t->bat_popup);
+}
+
+static void qs_open(SystrayWidget *t, GtkToggleButton *anchor) {
+    if (!g_qs) g_qs = qs_create(t, GTK_WIDGET(anchor));
+    QuickSettings *q = g_qs;
+    qs_adopt(q);
+    if (g_pwr_upower) power_query_upower(t); else { power_read_sysfs(&g_pwr); power_render(t); }
+    pwr_sync_brightness_slider(t);
+    if (GTK_IS_SWITCH(t->bt_power_sw)) refresh_bluetooth_ui(t);
+    gtk_stack_set_visible_child_name(GTK_STACK(q->stack), "main");
+    gtk_widget_show_all(q->stack);
+    if (g_ap) {
+        gtk_widget_hide(g_ap->foot); gtk_widget_set_no_show_all(g_ap->foot, TRUE);       /* no "Sound Settings" here */
+        gtk_widget_hide(g_ap->foot_sep); gtk_widget_set_no_show_all(g_ap->foot_sep, TRUE);
+        g_free(g_ap->apps_sig); g_ap->apps_sig = NULL;
+        ap_sync_device_names(g_ap);
+        ap_rebuild_players(g_ap);
+        pa_refresh_async(t);
+        if (!g_ap->pos_timer) g_ap->pos_timer = g_timeout_add(1000, ap_pos_tick, g_ap);
+        ap_sync_levels(g_ap);
+        ap_sync_apps(g_ap);
+        for (GList *l = g_ap->players; l; l = l->next) ap_player_update(l->data);
+        GList *kids = gtk_container_get_children(GTK_CONTAINER(g_ap->players_stack));
+        gtk_widget_set_visible(g_ap->players_frame, kids != NULL);
+        gtk_widget_set_visible(g_ap->dots_box, g_list_length(kids) > 1);
+        g_list_free(kids);
+    }
+    qs_sync(q);
+    shell_popup_cancel_close(q->win);
+    shell_reposition_popup_window(anchor, q->win);
+    gtk_window_resize(GTK_WINDOW(q->win), 1, 1);
+    gtk_widget_show(q->win);
+    shell_reposition_popup_window(anchor, q->win);
+    gtk_window_present(GTK_WINDOW(q->win));
+}
+
+/* sound changes while the panel is open (keys, other apps): keep the sliders and icons current */
+static void qs_on_pa_state(SystrayWidget *t) {
+    if (!g_qs || !gtk_widget_get_visible(g_qs->win) || !g_ap) return;
+    ap_sync_levels(g_ap);
+    ap_sync_apps(g_ap);
+}
+
+static gboolean g_qs_resetting = FALSE;
+static void qs_on_tray_click(SystrayWidget *t, GtkToggleButton *btn) {
+    if (g_qs_resetting) return;
+    g_qs_resetting = TRUE;
+    gtk_toggle_button_set_active(btn, FALSE);
+    g_qs_resetting = FALSE;
+    if (g_qs && gtk_widget_get_visible(g_qs->win)) { shell_popup_hide(g_qs->win); return; }
+    if (g_qs) {
+        gint64 *last = g_object_get_data(G_OBJECT(g_qs->win), "last-focus-hide-us");
+        if (last && g_get_monotonic_time() - *last < 300000) return;
+    }
+    qs_open(t, btn);
+}
+
+void systray_quick_settings_changed(UltimateShell *shell) {
+    SystrayWidget *t = g_systray;
+    if (!t) return;
+    if (!shell->tray_quick_settings && g_qs) {
+        if (gtk_widget_get_visible(g_qs->win)) gtk_widget_hide(g_qs->win);
+        qs_return(g_qs);
+    }
+    relayout_tray_containers(t);
+    rebuild_settings_list_ui(t);
+}
+
+/* ---- the group button: the members' icons side by side, one button ---- */
+static gboolean qs_is_member(SystrayWidget *t, TrayItem *it) {
+    if (!qs_enabled(t) || !it || !it->id) return FALSE;
+    if (!g_strcmp0(it->id, "builtin:audio") || !g_strcmp0(it->id, "builtin:network") ||
+        !g_strcmp0(it->id, "builtin:battery") || !g_strcmp0(it->id, "builtin:mic")) return TRUE;
+    return !g_strcmp0(it->id, "builtin:bluetooth");
+}
+
+/* each icon in the group follows its tray item's own icon (it keeps updating that one) */
+static void qs_mirror_copy(GtkImage *src, GParamSpec *ps, GtkImage *dst) {
+    gint px = gtk_image_get_pixel_size(src);
+    switch (gtk_image_get_storage_type(src)) {
+        case GTK_IMAGE_ICON_NAME: {
+            const gchar *n = NULL; GtkIconSize sz;
+            gtk_image_get_icon_name(src, &n, &sz);
+            if (n) gtk_image_set_from_icon_name(dst, n, GTK_ICON_SIZE_MENU);
+            break; }
+        case GTK_IMAGE_GICON: {
+            GIcon *gi = NULL; GtkIconSize sz;
+            gtk_image_get_gicon(src, &gi, &sz);
+            if (gi) gtk_image_set_from_gicon(dst, gi, GTK_ICON_SIZE_MENU);
+            break; }
+        case GTK_IMAGE_PIXBUF: gtk_image_set_from_pixbuf(dst, gtk_image_get_pixbuf(src)); break;
+        default: break;
+    }
+    if (px > 0) gtk_image_set_pixel_size(dst, px);
+}
+static GtkWidget *qs_mirror_icon(TrayItem *it) {
+    GtkWidget *img = gtk_image_new();
+    if (it && GTK_IS_IMAGE(it->image)) {
+        qs_mirror_copy(GTK_IMAGE(it->image), NULL, GTK_IMAGE(img));
+        g_signal_connect_object(it->image, "notify", G_CALLBACK(qs_mirror_copy), img, 0);
+        g_object_set_data(G_OBJECT(img), "qs-item", it);
+        if (it->button) gtk_widget_set_tooltip_text(img, gtk_widget_get_tooltip_text(it->button));
+    }
+    gtk_widget_set_no_show_all(img, TRUE);
+    return img;
+}
+
+static void on_qs_btn_toggled(GtkToggleButton *b, SystrayWidget *t) {
+    if (gtk_toggle_button_get_active(b)) qs_on_tray_click(t, b);
+}
+
+/* show the group (and which of its icons) as the option and the hardware say */
+static void qs_group_sync(SystrayWidget *t) {
+    if (!t || !t->qs_btn) return;
+    gboolean on = qs_enabled(t);
+    gtk_widget_set_visible(t->qs_btn, on);
+    if (!on) return;
+    gint icon_px = t->shell ? CLAMP(t->shell->tray_icon_size, 14, 28) : 16;
+    gint spacing = t->shell ? CLAMP(t->shell->tray_icon_spacing, 0, 16) : 2;
+    gtk_box_set_spacing(GTK_BOX(t->qs_icons), spacing + 10);   /* = separate buttons: 2 x (4px padding + 1px border) + spacing */
+    GList *kids = gtk_container_get_children(GTK_CONTAINER(t->qs_icons));
+    for (GList *l = kids; l; l = l->next) {
+        TrayItem *it = g_object_get_data(G_OBJECT(l->data), "qs-item");
+        if (!it) continue;
+        gboolean show = TRUE;
+        if (it == t->mic_item) show = t->mic_shown;                  /* joins only while the mic is used */
+        else if (it == t->bat_item) show = t->bat_present && (!t->shell || t->shell->tray_enable_battery);
+        else if (it == t->bt_item) show = t->bt_adapter_path != NULL;
+        else if (it == t->net_item) show = !t->shell || t->shell->tray_enable_network;
+        else if (it == t->vol_item) show = !t->shell || t->shell->tray_enable_audio;
+        gtk_widget_set_visible(l->data, show);
+        if (gtk_image_get_storage_type(GTK_IMAGE(l->data)) == GTK_IMAGE_ICON_NAME)
+            gtk_image_set_pixel_size(GTK_IMAGE(l->data), icon_px);
+    }
+    g_list_free(kids);
+}
+
+static void qs_group_create(SystrayWidget *t) {
+    t->qs_btn = gtk_toggle_button_new();
+    gtk_button_set_relief(GTK_BUTTON(t->qs_btn), GTK_RELIEF_NONE);
+    gtk_style_context_add_class(gtk_widget_get_style_context(t->qs_btn), "ultimate-module-btn");
+    gtk_widget_set_tooltip_text(t->qs_btn, "Quick Settings");
+    t->qs_icons = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    TrayItem *order[] = { t->mic_item, t->bt_item, t->net_item, t->vol_item, t->bat_item };   /* like Windows */
+    for (guint i = 0; i < G_N_ELEMENTS(order); i++)
+        if (order[i]) gtk_box_pack_start(GTK_BOX(t->qs_icons), qs_mirror_icon(order[i]), FALSE, FALSE, 0);
+    gtk_container_add(GTK_CONTAINER(t->qs_btn), t->qs_icons);
+    gtk_widget_show(t->qs_icons);
+    gtk_widget_set_no_show_all(t->qs_btn, TRUE);
+    gtk_widget_add_events(t->qs_btn, GDK_SCROLL_MASK | GDK_SMOOTH_SCROLL_MASK);
+    g_signal_connect(t->qs_btn, "toggled", G_CALLBACK(on_qs_btn_toggled), t);
+    g_signal_connect(t->qs_btn, "scroll-event", G_CALLBACK(on_vol_scroll), t);   /* scroll = volume */
+    gtk_box_pack_start(GTK_BOX(t->root_box), t->qs_btn, FALSE, FALSE, 0);   /* last: next to the clock */
+}
+
 static gboolean is_tray_item_on_main_panel(TrayItem *item) {
     if (!item || !item->tray || !item->button) return !item->is_hidden;
     if (item->tray->shell && item->tray->shell->tray_show_all) return TRUE;
+    if (item->is_xembed) return !item->is_hidden;          /* hidden = in the ▲ popup */
     GtkWidget *parent = gtk_widget_get_parent(item->button);
     if (parent == item->tray->visible_box) return TRUE;
     if (parent == item->tray->overflow_grid) return FALSE;
@@ -4728,7 +5493,6 @@ static void lock_overflow_popup_for_menu(SystrayWidget *tray, GtkWidget *menu) {
 
 static void toggle_tray_item_panel_location(TrayItem *item) {
     if (!item || !item->tray) return;
-    if (item->is_xembed) return;   /* old embedded icons must stay on the panel */
     SystrayWidget *tray = item->tray;
     gboolean target_was_on_panel = is_tray_item_on_main_panel(item);
 
@@ -4832,8 +5596,9 @@ static gboolean on_hw_poll_tick(gpointer user_data) {
 }
 
 static void on_chevron_toggled(GtkToggleButton *btn, SystrayWidget *tray) {
-    if (!gtk_toggle_button_get_active(btn)) {
-        gtk_widget_hide(tray->overflow_popup);
+    gboolean on = gtk_toggle_button_get_active(btn);
+    if (!on) {
+        shell_popup_hide(tray->overflow_popup);
         return;
     }
     GList *children = gtk_container_get_children(GTK_CONTAINER(tray->overflow_grid));
@@ -5108,10 +5873,46 @@ static gboolean refresh_sni_dbus_menu_hide_item_delayed(gpointer data) {
     return G_SOURCE_REMOVE;
 }
 
+/* Older (XEmbed) icons: open the app's own menu - a real right-click on its icon window. The pointer is
+   moved onto the icon first (the app opens its menu there), our click shield steps aside for it. */
+static gboolean xembed_open_app_menu_later(gpointer data) {
+    TrayItem *item = data;
+    GtkWidget *wrap = (item->ov_wrap && gtk_widget_get_mapped(item->ov_wrap)) ? item->ov_wrap : item->button;
+    GdkDisplay *gd = gdk_display_get_default();
+    if (!GDK_IS_X11_DISPLAY(gd) || !GTK_IS_WIDGET(wrap) || !gtk_widget_get_window(wrap)) return G_SOURCE_REMOVE;
+    Display *dpy = GDK_DISPLAY_XDISPLAY(gd);
+    int eb, er, mj, mn;
+    if (!XTestQueryExtension(dpy, &eb, &er, &mj, &mn)) return G_SOURCE_REMOVE;
+    gint ox = 0, oy = 0;
+    gdk_window_get_origin(gtk_widget_get_window(wrap), &ox, &oy);
+    GtkAllocation a; gtk_widget_get_allocation(wrap, &a);
+    XWarpPointer(dpy, None, DefaultRootWindow(dpy), 0, 0, 0, 0, ox + a.x + a.width / 2, oy + a.y + a.height / 2);
+    GdkWindow *sh = xembed_shield_of(wrap);
+    if (sh) gdk_window_hide(sh);
+    gdk_display_sync(gd);
+    XTestFakeButtonEvent(dpy, 3, True, CurrentTime);
+    XTestFakeButtonEvent(dpy, 3, False, CurrentTime);
+    XFlush(dpy);
+    g_timeout_add(400, xembed_restore_shield, g_object_ref(wrap));
+    return G_SOURCE_REMOVE;
+}
+static void on_xembed_app_menu_activate(GtkMenuItem *mi, TrayItem *item) {
+    g_timeout_add(120, xembed_open_app_menu_later, item);    /* after our menu has let go of the pointer */
+}
+
 static void popup_sni_shell_action_menu(TrayItem *item, GdkEventButton *event) {
     GtkWidget *menu = gtk_menu_new();
     ensure_menu_rgba_visual(menu);
     gtk_style_context_add_class(gtk_widget_get_style_context(menu), "ultimate-themed-menu");
+
+    if (item->is_xembed) {
+        gchar *lbl = g_strdup_printf("☰ %s menu", item->display_name ? item->display_name : "App");
+        GtkWidget *am = gtk_menu_item_new_with_label(lbl);
+        g_free(lbl);
+        g_signal_connect(am, "activate", G_CALLBACK(on_xembed_app_menu_activate), item);
+        gtk_menu_shell_append(GTK_MENU_SHELL(menu), am);
+        gtk_menu_shell_append(GTK_MENU_SHELL(menu), gtk_separator_menu_item_new());
+    }
 
     if (item->item_proxy) {
         GtkWidget *open_item = gtk_menu_item_new_with_label("🗔 Open / Toggle App Window");
@@ -5443,8 +6244,13 @@ static void xembed_refresh_visibility(SystrayWidget *tray) {
     for (GList *l = tray->all_items; l; l = l->next) {
         TrayItem *it = (TrayItem *)l->data;
         if (!it || !it->is_xembed || !GTK_IS_WIDGET(it->button)) continue;
-        gboolean hide = (it->is_network_applet && network_applet_suppressed(tray)) || sni_item_has_pid(tray, it->pid);
+        gboolean show_all = tray->shell ? tray->shell->tray_show_all : FALSE;
+        (void)show_all;
+        gboolean hide = (it->is_network_applet && network_applet_suppressed(tray)) || sni_item_has_pid(tray, it->pid) ||
+                        (it->is_hidden && !show_all);        /* hidden: its icon lives in the ▲ popup */
         gtk_widget_set_visible(it->button, !hide);
+        if (it->ov_wrap) gtk_widget_set_visible(it->ov_wrap, it->is_hidden && !show_all &&
+                        !((it->is_network_applet && network_applet_suppressed(tray)) || sni_item_has_pid(tray, it->pid)));
     }
 }
 
@@ -5484,16 +6290,29 @@ static void xembed_send_button(TrayItem *item, GdkEventButton *ev, int type) {
     gdk_x11_display_error_trap_pop_ignored(gdk_dpy);
 }
 
+static void xembed_raise_shield(GtkWidget *wrap);
 static gboolean xembed_restore_shield(gpointer data) {
     GtkWidget *wrap = GTK_WIDGET(data);
-    if (GTK_IS_EVENT_BOX(wrap)) gtk_event_box_set_above_child(GTK_EVENT_BOX(wrap), TRUE);
+    xembed_raise_shield(wrap);
     g_object_unref(wrap);
     return G_SOURCE_REMOVE;
 }
 
+static void popup_sni_shell_action_menu(TrayItem *item, GdkEventButton *event);
+static void toggle_tray_item_panel_location(TrayItem *item);
+
 static gboolean on_xembed_wrapper_release(GtkWidget *w, GdkEventButton *ev, TrayItem *item) {
     /* Runs only when the drag handler did not consume the release (i.e. it was a click). */
     if (ev->button < 1 || ev->button > 3) return FALSE;
+
+    /* Same rules as the other tray icons: middle-click hides / brings back; with
+       "Menu is primary action" right-click opens our Hide / Move menu. Everything else goes to the app. */
+    if (item->xembed_dragged) { item->xembed_dragged = FALSE; return TRUE; }   /* it was a move */
+    if (ev->button == 2) { toggle_tray_item_panel_location(item); return TRUE; }
+    if (ev->button == 3 && item->tray && item->tray->shell && item->tray->shell->tray_menu_is_primary) {
+        popup_sni_shell_action_menu(item, ev);
+        return TRUE;
+    }
 
     GdkDisplay *gdk_dpy = gdk_display_get_default();
     if (!GDK_IS_X11_DISPLAY(gdk_dpy)) return FALSE;
@@ -5504,7 +6323,7 @@ static gboolean on_xembed_wrapper_release(GtkWidget *w, GdkEventButton *ev, Tray
         /* GTK3 apps ignore synthetic (XSendEvent) clicks, so drop our drag
          * shield for a moment and replay a real click with XTest — the pointer
          * is still over the icon, so the app receives it directly. */
-        gtk_event_box_set_above_child(GTK_EVENT_BOX(w), FALSE);
+        if (xembed_shield_of(w)) gdk_window_hide(xembed_shield_of(w));   /* let this one click through */
         gdk_display_sync(gdk_dpy);
         XTestFakeButtonEvent(dpy, ev->button, True, CurrentTime);
         XTestFakeButtonEvent(dpy, ev->button, False, CurrentTime);
@@ -5517,15 +6336,152 @@ static gboolean on_xembed_wrapper_release(GtkWidget *w, GdkEventButton *ev, Tray
     return TRUE;
 }
 
+/* The app's icon is a real X11 window inside our GtkSocket. GTK's own event-box input window is only
+   simulated by GDK, so the X server delivered every click to the app underneath. Put a real
+   (native) input-only window above it: clicks, drags and hover reach us; we forward clicks. */
+
+static GdkWindow *xembed_shield_of(GtkWidget *wrap) { return g_object_get_data(G_OBJECT(wrap), "xembed-shield"); }
+
+static void xembed_raise_shield(GtkWidget *wrap) {
+    GdkWindow *sh = xembed_shield_of(wrap);
+    if (sh && gtk_widget_get_mapped(wrap)) { gdk_window_show(sh); gdk_window_raise(sh); }
+}
+static gboolean xembed_raise_shield_later(gpointer wrap) {
+    xembed_raise_shield(GTK_WIDGET(wrap));
+    g_object_unref(wrap);
+    return G_SOURCE_REMOVE;
+}
+static void on_xembed_plug_added(GtkSocket *sock, GtkWidget *wrap) {
+    xembed_raise_shield(wrap);
+    g_timeout_add(300, xembed_raise_shield_later, g_object_ref(wrap));   /* once the app has mapped it */
+}
+static void on_xembed_wrap_realize(GtkWidget *wrap, gpointer d) {
+    if (xembed_shield_of(wrap)) return;
+    GtkAllocation a; gtk_widget_get_allocation(wrap, &a);
+    GdkWindowAttr at = { 0 };
+    at.window_type = GDK_WINDOW_CHILD;
+    at.wclass = GDK_INPUT_ONLY;
+    at.x = a.x; at.y = a.y; at.width = MAX(1, a.width); at.height = MAX(1, a.height);
+    at.event_mask = gtk_widget_get_events(wrap) | GDK_BUTTON_PRESS_MASK | GDK_BUTTON_RELEASE_MASK |
+                    GDK_POINTER_MOTION_MASK | GDK_BUTTON1_MOTION_MASK | GDK_ENTER_NOTIFY_MASK | GDK_LEAVE_NOTIFY_MASK;
+    GdkWindow *sh = gdk_window_new(gtk_widget_get_parent_window(wrap), &at, GDK_WA_X | GDK_WA_Y);
+    gtk_widget_register_window(wrap, sh);
+    gdk_window_ensure_native(sh);
+    g_object_set_data(G_OBJECT(wrap), "xembed-shield", sh);
+}
+static void on_xembed_wrap_unrealize(GtkWidget *wrap, gpointer d) {
+    GdkWindow *sh = xembed_shield_of(wrap);
+    if (!sh) return;
+    g_object_set_data(G_OBJECT(wrap), "xembed-shield", NULL);
+    gtk_widget_unregister_window(wrap, sh);
+    gdk_window_destroy(sh);
+}
+static void on_xembed_wrap_allocate(GtkWidget *wrap, GdkRectangle *a, gpointer d) {
+    GdkWindow *sh = xembed_shield_of(wrap);
+    if (sh) {
+        gdk_window_move_resize(sh, a->x, a->y, MAX(1, a->width), MAX(1, a->height));
+        if (gtk_widget_get_mapped(wrap)) gdk_window_raise(sh);
+    }
+}
+static void on_xembed_wrap_map(GtkWidget *wrap, gpointer d) {
+    xembed_raise_shield(wrap);
+    g_timeout_add(50, xembed_raise_shield_later, g_object_ref(wrap));
+}
+static void on_xembed_wrap_unmap(GtkWidget *wrap, gpointer d) {
+    GdkWindow *sh = xembed_shield_of(wrap);
+    if (sh) gdk_window_hide(sh);
+}
+
+static gboolean on_xembed_wrapper_crossing(GtkWidget *w, GdkEventCrossing *ev, gpointer d) {
+    if (ev->detail == GDK_NOTIFY_INFERIOR) return FALSE;
+    if (ev->type == GDK_ENTER_NOTIFY) gtk_widget_set_state_flags(w, GTK_STATE_FLAG_PRELIGHT, FALSE);
+    else gtk_widget_unset_state_flags(w, GTK_STATE_FLAG_PRELIGHT);
+    return FALSE;
+}
+
 static gboolean on_xembed_wrapper_press(GtkWidget *w, GdkEventButton *ev, TrayItem *item) {
-    return FALSE; /* let the drag-tracking handler see it; we forward on release */
+    /* right / middle press: ours (handled on release) - must not reach the panel, which would open
+       its own plugin menu (Properties / Move / Remove). Left press goes on to the drag tracking. */
+    if (ev->button == 2 || ev->button == 3) return TRUE;
+    return FALSE;
+}
+
+/* one slot for the app's icon window: a socket in an event box with our click shield */
+static GtkWidget *xembed_make_slot(TrayItem *item, gint icon_px, GtkWidget **sock_out) {
+    GtkWidget *sock = gtk_socket_new();
+    /* the app draws its icon at the socket's size: exactly the tray icon size, padded like the others */
+    gtk_widget_set_size_request(sock, icon_px, icon_px);
+    gtk_widget_set_valign(sock, GTK_ALIGN_CENTER);
+    gtk_widget_set_halign(sock, GTK_ALIGN_CENTER);
+    gtk_widget_set_margin_start(sock, 5);
+    gtk_widget_set_margin_end(sock, 5);
+    gtk_widget_show(sock);
+
+    GtkWidget *wrap = gtk_event_box_new();
+    gtk_event_box_set_visible_window(GTK_EVENT_BOX(wrap), FALSE);
+    gtk_event_box_set_above_child(GTK_EVENT_BOX(wrap), FALSE);    /* our native shield does this */
+    g_signal_connect(wrap, "realize", G_CALLBACK(on_xembed_wrap_realize), NULL);
+    g_signal_connect(wrap, "unrealize", G_CALLBACK(on_xembed_wrap_unrealize), NULL);
+    g_signal_connect(wrap, "size-allocate", G_CALLBACK(on_xembed_wrap_allocate), NULL);
+    g_signal_connect(wrap, "unmap", G_CALLBACK(on_xembed_wrap_unmap), NULL);
+    g_signal_connect(wrap, "map", G_CALLBACK(on_xembed_wrap_map), NULL);
+    gtk_widget_set_no_show_all(wrap, TRUE);
+    gtk_widget_set_valign(wrap, GTK_ALIGN_FILL);
+    gtk_style_context_add_class(gtk_widget_get_style_context(wrap), "ultimate-module-btn");
+    gtk_container_add(GTK_CONTAINER(wrap), sock);
+    gtk_widget_set_tooltip_text(wrap, item->display_name);
+    g_signal_connect(wrap, "button-press-event", G_CALLBACK(on_xembed_wrapper_press), item);
+    g_signal_connect(wrap, "button-release-event", G_CALLBACK(on_xembed_wrapper_release), item);
+    gtk_widget_add_events(wrap, GDK_ENTER_NOTIFY_MASK | GDK_LEAVE_NOTIFY_MASK);
+    g_signal_connect(wrap, "enter-notify-event", G_CALLBACK(on_xembed_wrapper_crossing), NULL);
+    g_signal_connect(wrap, "leave-notify-event", G_CALLBACK(on_xembed_wrapper_crossing), NULL);
+    g_signal_connect(sock, "plug-removed", G_CALLBACK(on_xembed_plug_removed), item);
+    g_signal_connect(sock, "plug-added", G_CALLBACK(on_xembed_plug_added), wrap);
+    *sock_out = sock;
+    return wrap;
+}
+
+/* Put the app's icon window into the panel slot or the ▲ popup slot. Done only when that changes
+   (hiding / showing), never per opening: the window is moved, not re-created. */
+static void xembed_place(TrayItem *item, gboolean in_popup, gint col, gint row, gint icon_px) {
+    SystrayWidget *tray = item->tray;
+    if (in_popup && !item->ov_wrap) {
+        item->ov_wrap = xembed_make_slot(item, icon_px, &item->ov_socket);
+        gtk_style_context_add_class(gtk_widget_get_style_context(item->ov_wrap), "overflow-tray-btn");
+        gtk_widget_set_size_request(item->ov_wrap, 36, 36);
+        gtk_widget_set_halign(item->ov_wrap, GTK_ALIGN_CENTER);
+        gtk_widget_set_valign(item->ov_wrap, GTK_ALIGN_CENTER);
+        setup_tray_item_dnd_on(item, item->ov_wrap);
+    }
+    if (in_popup) {    /* its cell in the popup grid (the slot itself stays: moving it would drop the icon) */
+        if (gtk_widget_get_parent(item->ov_wrap) != tray->overflow_grid)
+            gtk_grid_attach(GTK_GRID(tray->overflow_grid), item->ov_wrap, col, row, 1, 1);
+        else
+            gtk_container_child_set(GTK_CONTAINER(tray->overflow_grid), item->ov_wrap, "left-attach", col, "top-attach", row, NULL);
+    }
+    GtkWidget *target = in_popup ? item->ov_socket : item->socket;
+    if (item->plug_xid && item->plug_in != target) {
+        GdkDisplay *gd = gdk_display_get_default();
+        gtk_widget_realize(target);                     /* the popup may never have been shown yet */
+        item->migrating = (item->plug_in != NULL);
+        gdk_x11_display_error_trap_push(gd);
+        gtk_socket_add_id(GTK_SOCKET(target), (Window)item->plug_xid);
+        gdk_x11_display_error_trap_pop_ignored(gd);
+        item->plug_in = target;
+    }
+    gtk_widget_set_visible(item->button, !in_popup);
+    if (item->ov_wrap) gtk_widget_set_visible(item->ov_wrap, in_popup);
 }
 
 static gboolean on_xembed_plug_removed(GtkSocket *socket, gpointer user_data) {
     TrayItem *item = (TrayItem *)user_data;
+    /* moved to the other slot: not gone */
+    if (item && item->migrating) { item->migrating = FALSE; return TRUE; }
+    if (item && GTK_WIDGET(socket) != item->plug_in) return TRUE;   /* a slot it already left */
     SystrayWidget *tray = item ? item->tray : NULL;
     if (tray) tray->all_items = g_list_remove(tray->all_items, item);
     if (item && GTK_IS_WIDGET(item->button)) gtk_widget_destroy(item->button);
+    if (item && GTK_IS_WIDGET(item->ov_wrap)) gtk_widget_destroy(item->ov_wrap);
     if (item) { g_free(item->id); g_free(item->display_name); g_free(item); }
     if (tray) { relayout_tray_containers(tray); rebuild_settings_list_ui(tray); }
     return TRUE;
@@ -5546,8 +6502,7 @@ static GdkFilterReturn xembed_root_event_filter(GdkXEvent *xevent, GdkEvent *eve
     if (xev->xclient.message_type == opcode_atom && xev->xclient.data.l[1] == SYSTEM_TRAY_REQUEST_DOCK) {
         Window plug_xid = (Window)xev->xclient.data.l[2];
         if (plug_xid != None) {
-            gint icon_px = (tray->shell && tray->shell->tray_icon_size > 0)
-                         ? CLAMP(tray->shell->tray_icon_size, 14, 28) : 18;
+            gint icon_px = tray->shell ? CLAMP(tray->shell->tray_icon_size, 14, 28) : 16;   /* same as the others */
             gint plug_pid = 0;
             gchar *plug_name = NULL;
             {
@@ -5586,43 +6541,23 @@ static GdkFilterReturn xembed_root_event_filter(GdkXEvent *xevent, GdkEvent *eve
             item->display_name = g_strdup(app);
             item->is_xembed = TRUE;
             item->is_builtin = FALSE;
-            item->is_hidden = FALSE;
+            item->is_hidden = load_hidden_state_for_id(tray, item_id, FALSE);   /* remembered like any icon */
             item->pid = plug_pid;
             item->plug_xid = (gulong)plug_xid;
             item->is_network_applet = is_network_applet_name(comm) || is_network_applet_name(plug_name);
             g_free(comm);
             g_free(plug_name);
 
-            GtkWidget *sock = gtk_socket_new();
-            gtk_widget_set_size_request(sock, icon_px + 4, icon_px + 4);
-            gtk_widget_set_valign(sock, GTK_ALIGN_CENTER);
-            gtk_widget_set_halign(sock, GTK_ALIGN_CENTER);
-            gtk_widget_show(sock);
-            item->socket = sock;
-
-            GtkWidget *wrap = gtk_event_box_new();
-            gtk_event_box_set_visible_window(GTK_EVENT_BOX(wrap), FALSE);
-            gtk_event_box_set_above_child(GTK_EVENT_BOX(wrap), TRUE);
-            gtk_widget_set_no_show_all(wrap, TRUE);
-            gtk_widget_set_valign(wrap, GTK_ALIGN_CENTER);
-            gtk_style_context_add_class(gtk_widget_get_style_context(wrap), "ultimate-module-btn");
-            gtk_container_add(GTK_CONTAINER(wrap), sock);
-            gtk_widget_set_tooltip_text(wrap, item->display_name);
+            GtkWidget *wrap = xembed_make_slot(item, icon_px, &item->socket);
             item->button = wrap;
-
             setup_tray_item_dnd(item);
-            g_signal_connect(wrap, "button-press-event", G_CALLBACK(on_xembed_wrapper_press), item);
-            g_signal_connect(wrap, "button-release-event", G_CALLBACK(on_xembed_wrapper_release), item);
-            g_signal_connect(sock, "plug-removed", G_CALLBACK(on_xembed_plug_removed), item);
+            item->plug_in = NULL;                                  /* relayout embeds it where it belongs */
 
             tray->all_items = g_list_append(tray->all_items, item);
             tray->all_items = g_list_sort(tray->all_items, compare_tray_items_by_saved_order);
-            relayout_tray_containers(tray);   /* packs the wrapper into the visible box */
-
-            gdk_x11_display_error_trap_push(gdk_dpy);
-            gtk_socket_add_id(GTK_SOCKET(sock), plug_xid);
-            gdk_x11_display_error_trap_pop_ignored(gdk_dpy);
+            relayout_tray_containers(tray);
             xembed_refresh_visibility(tray);
+            tray_hide_empty_boxes(tray);
             rebuild_settings_list_ui(tray);
             return GDK_FILTER_REMOVE;
         }
@@ -5721,8 +6656,20 @@ static void rebuild_settings_list_ui(SystrayWidget *tray) {
     for (GList *l = old; l != NULL; l = l->next) gtk_widget_destroy(GTK_WIDGET(l->data));
     g_list_free(old);
 
+    if (qs_enabled(tray)) {
+        GtkWidget *row = gtk_list_box_row_new();
+        GtkWidget *note = gtk_label_new("Sound, Network, Power, Bluetooth and the microphone are in Quick Settings.");
+        gtk_label_set_xalign(GTK_LABEL(note), 0.0);
+        gtk_label_set_line_wrap(GTK_LABEL(note), TRUE);
+        gtk_style_context_add_class(gtk_widget_get_style_context(note), "dim-label");
+        gtk_widget_set_margin_start(note, 6); gtk_widget_set_margin_top(note, 4); gtk_widget_set_margin_bottom(note, 4);
+        gtk_container_add(GTK_CONTAINER(row), note);
+        gtk_list_box_row_set_activatable(GTK_LIST_BOX_ROW(row), FALSE);
+        gtk_container_add(GTK_CONTAINER(tray->settings_list_box), row);
+    }
     for (GList *l = tray->all_items; l != NULL; l = l->next) {
         TrayItem *item = (TrayItem *)l->data;
+        if (qs_is_member(tray, item)) continue;            /* managed in Quick Settings */
         GtkWidget *row = gtk_list_box_row_new();
         GtkWidget *hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
         gtk_widget_set_margin_start(hbox, 6);
@@ -5730,15 +6677,23 @@ static void rebuild_settings_list_ui(SystrayWidget *tray) {
         gtk_widget_set_margin_top(hbox, 4);
         gtk_widget_set_margin_bottom(hbox, 4);
 
-        GtkWidget *lbl = gtk_label_new(item->display_name ? item->display_name : item->id);
+        /* first line only, shortened with "…" (some apps put a whole help text in their title);
+           the full text is the tooltip - it used to make the Settings window very wide */
+        const gchar *full = item->display_name ? item->display_name : item->id;
+        gchar *first = g_strdup(full ? full : "");
+        gchar *nl = strchr(first, '\n');
+        if (nl) *nl = '\0';
+        GtkWidget *lbl = gtk_label_new(g_strstrip(first));
+        g_free(first);
         gtk_label_set_xalign(GTK_LABEL(lbl), 0.0);
+        gtk_label_set_ellipsize(GTK_LABEL(lbl), PANGO_ELLIPSIZE_END);
+        gtk_label_set_width_chars(GTK_LABEL(lbl), 8);
+        if (full && (strchr(full, '\n') || g_utf8_strlen(full, -1) > 24)) gtk_widget_set_tooltip_text(lbl, full);
 
         GtkWidget *show_chk = gtk_check_button_new_with_label("Show on Panel");
         gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(show_chk), !item->is_hidden);
-        if (item->is_xembed) {
-            gtk_widget_set_sensitive(show_chk, FALSE);
-            gtk_widget_set_tooltip_text(show_chk, "This icon uses the old tray protocol and has to stay on the panel.");
-        }
+        if (item->is_xembed)
+            gtk_widget_set_tooltip_text(show_chk, "Older tray icon: when hidden it waits in its place and ▲ shows it.");
         g_signal_connect(show_chk, "toggled", G_CALLBACK(on_item_show_toggled), item);
 
         GtkWidget *btn_left  = gtk_button_new_with_label("⬅");
@@ -6800,6 +7755,10 @@ static void refresh_bluetooth_ui(SystrayWidget *tray) {
 
 static void on_bt_toggled(GtkToggleButton *btn, SystrayWidget *tray) {
     if (!tray || !tray->bt_popup) return;
+    if (qs_enabled(tray)) {
+        if (gtk_toggle_button_get_active(btn)) qs_on_tray_click(tray, btn);
+        return;
+    }
     if (gtk_toggle_button_get_active(btn)) {
         shell_toggle_popup_window(btn, tray->bt_popup);
         refresh_bluetooth_ui(tray);   /* live signals keep it current from here on */
@@ -7873,6 +8832,8 @@ GtkWidget *systray_widget_new(UltimateShell *shell) {
     tray->xembed_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 2);
     gtk_widget_set_valign(tray->xembed_box, GTK_ALIGN_CENTER);
     gtk_box_pack_start(GTK_BOX(tray->root_box), tray->xembed_box, FALSE, FALSE, 0);
+    qs_group_create(tray);
+    relayout_tray_containers(tray);
 
     init_x11_xembed_tray_manager(tray);
 

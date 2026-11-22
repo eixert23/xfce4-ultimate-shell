@@ -5,6 +5,7 @@
 
 GtkWidget *systray_widget_new(UltimateShell *shell);
 void systray_apply_settings(UltimateShell *shell);
+void systray_quick_settings_changed(UltimateShell *shell);   /* option switched on / off */
 void systray_ibus_apply_mode(UltimateShell *shell, gboolean force);
 void systray_populate_settings_box(UltimateShell *shell, GtkWidget *target_vbox);
 

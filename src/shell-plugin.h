@@ -35,8 +35,11 @@ typedef enum {
     START_STYLE_WIN7       = 1,
     START_STYLE_WIN11      = 2,
     START_STYLE_WHISKER    = 3,
-    START_STYLE_FULLSCREEN = 4
+    START_STYLE_FULLSCREEN = 4,
+    START_STYLE_WIN10      = 5,   /* Windows 10 Tiles Menu */
+    START_STYLE_GNOME      = 6    /* GNOME App Grid */
 } StartMenuStyle;
+#define START_STYLE_COUNT 7
 
 typedef enum {
     START_BTN_MODE_ICON_LABEL = 0,
@@ -105,6 +108,8 @@ typedef struct {
     XfcePanelPlugin       *plugin;
     XfconfChannel         *channel;
     ShellLayoutMode        mode;
+    gboolean               gnome_style;
+    gboolean               super_key_start;   /* the Super (Windows) key opens the start menu */   /* LAYOUT_MACOS shaped as GNOME: [WS App] [Clock] [Tray QS] + dock */
     ShellThemeMode         theme_mode;
     gint                   color_mode;         /* ShellColorMode */
     StartMenuStyle         start_style;
@@ -154,21 +159,25 @@ typedef struct {
     gchar                 *start_btn_icon;
     gint                   start_menu_w;
     gint                   start_menu_h;
-    gint                   start_style_w[5];
-    gint                   start_style_h[5];
-    gint                   start_style_cat_icon[5];
-    gint                   start_style_cat_pt[5];
-    gint                   start_style_cat_weight[5];
-    gint                   start_style_cat_spacing[5];
-    gint                   start_style_list_icon[5];
-    gint                   start_style_grid_icon[5];
-    gint                   start_style_label_pt[5];
-    gint                   start_style_grid_cols[5];
+    gint                   start_style_w[START_STYLE_COUNT];
+    gint                   start_style_h[START_STYLE_COUNT];
+    gint                   start_style_cat_icon[START_STYLE_COUNT];
+    gint                   start_style_cat_pt[START_STYLE_COUNT];
+    gint                   start_style_cat_weight[START_STYLE_COUNT];
+    gint                   start_style_cat_spacing[START_STYLE_COUNT];
+    gint                   start_style_list_icon[START_STYLE_COUNT];
+    gint                   start_style_grid_icon[START_STYLE_COUNT];
+    gint                   start_style_label_pt[START_STYLE_COUNT];
+    gint                   start_style_grid_cols[START_STYLE_COUNT];
     gint                   start_style_fs_rows;
-    StartCatDisplayMode    start_style_cat_mode[5];
-    StartSearchPosMode     start_style_search_pos[5];
-    gboolean               start_style_show_desc[5];
-    gboolean               start_style_hover_cat[5];
+    gint                   start_gnome_rows;    /* GNOME App Grid rows (Launchpad uses start_style_fs_rows) */
+    gchar                 *win10_tile_sizes;
+    gchar                 *win10_tile_pos;
+    gchar                 *win10_groups;       /* tile group names, ";"-separated, in order */     /* "app.desktop=col,row;..." free tile placement */   /* "app.desktop=s;other.desktop=w" (s/m/w) */
+    StartCatDisplayMode    start_style_cat_mode[START_STYLE_COUNT];
+    StartSearchPosMode     start_style_search_pos[START_STYLE_COUNT];
+    gboolean               start_style_show_desc[START_STYLE_COUNT];
+    gboolean               start_style_hover_cat[START_STYLE_COUNT];
 
     /* Favorites & Windows 7 Extra Shortcuts */
     gchar                 *start_favorites;
@@ -186,6 +195,7 @@ typedef struct {
     gboolean               start_show_recommended;   /* Recent & Recommended section (off by default) */
     gboolean               start_recommend_files;
     gboolean               start_whisker_grid;       /* Whisker: show apps as icons */
+    gboolean               win10_show_tiles;         /* Windows 10 menu: pinned tiles pane */
     gboolean               start_show_user_header;
     gboolean               start_show_lock;
     gboolean               start_show_logout;
@@ -196,6 +206,8 @@ typedef struct {
     /* System Tray & PulseAudio Customization Options */
     gboolean               tray_show_all;
     gboolean       tray_menu_is_primary;
+    gboolean       tray_quick_settings;   /* Sound / Network / Power (+ Bluetooth, mic) as one Quick Settings panel */
+    gboolean       tray_qs_bluetooth;     /* Bluetooth icon joins the Quick Settings group */
     gboolean       tray_request_symbolic;
     gboolean               tray_hide_new_default;
     gboolean               tray_enable_network;
@@ -232,7 +244,8 @@ typedef struct {
     gboolean               dock_magnify;
     gboolean              dock_show_tooltips;
     gint                   dock_opacity;
-    gboolean               dock_full_width;
+    gboolean               dock_full_width;   /* bottom: full width; left/right: full height */
+    gint                   dock_style;        /* 0 = macOS dock, 1 = Ubuntu dock (left, full height, no zoom) */
     gint                  dock_full_width_layout;
     gboolean               dock_show_trash;
     gint                   dock_border_w;
@@ -296,6 +309,7 @@ typedef struct {
     GtkWidget *dock_trash_btn;
     /* workspace indicator */
     GtkWidget *ws_widget;
+    GtkWidget *app_title_widget;   /* GNOME mode: focused app icon + name */
     GtkWidget *center_group;     /* centered group inside center_box (Windows layouts) */
     gboolean   ws_enabled;
     gint       ws_style;         /* 0 GNOME pills, 1 dots, 2 numbers */
@@ -305,7 +319,8 @@ typedef struct {
     gboolean   ws_hide_single;
     gint       win_layout;
     gboolean   tray_ibus_modern;
-    gint       anim_mode;     /* 0 off, 1 subtle, 2 full */
+    gint       anim_mode;     /* 0 off, 1 fade, 2 slide */
+    gint       anim_style;    /* 1 fade, 2 slide - kept while animations are off */
     gint       anim_speed;    /* percent: 50 = twice as fast, 200 = half speed */   /* run IBus with the StatusNotifier tray icon */       /* Windows panel layout, see WIN_LAYOUT_* */
 } UltimateShell;
 
@@ -318,6 +333,7 @@ enum {
 
 void shell_apply_layout(UltimateShell *shell, ShellLayoutMode new_mode);
 void shell_apply_theme(UltimateShell *shell);
+void shell_set_dark_mode(UltimateShell *shell, gboolean dark);   /* Quick Settings: Light <-> Dark colours */
 void shell_apply_appearance_css(UltimateShell *shell);
 void shell_palette_get(UltimateShell *shell, ShellPalette *out);
 GtkWidget *shell_create_popup_window(GtkWidget *toggle_btn, gint width, gint height, gboolean resizable);
@@ -325,6 +341,8 @@ void shell_toggle_popup_window(GtkToggleButton *btn, GtkWidget *popup_win);
 void shell_reposition_popup_window(GtkToggleButton *btn, GtkWidget *popup_win);
 gboolean shell_winck_on_left(UltimateShell *shell);
 gint     shell_anim_ms(gint base_ms);   /* 0 when animations are off */
+void     shell_popup_hide(GtkWidget *win);          /* close with the exit animation */
+void     shell_popup_cancel_close(GtkWidget *win);
 gboolean shell_place_popup_at_button(GtkWidget *btn, gint pw, gint ph, gboolean centered, gint *x, gint *y);
 void shell_popup_menu_at_button(GtkMenu *menu, GtkWidget *btn, const GdkEvent *ev);
 

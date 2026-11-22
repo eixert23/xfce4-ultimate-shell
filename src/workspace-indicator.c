@@ -2,6 +2,8 @@
    as a wider pill that slides smoothly. Click a dot to switch, scroll to move,
    right-click for workspace actions. */
 #include "workspace-indicator.h"
+#include "start-menu.h"
+#include "dock-window.h"
 #include <math.h>
 #include <libwnck/libwnck.h>
 
@@ -209,6 +211,10 @@ static void ws_popup_menu(WsInd *i, GdkEventButton *ev) {
 static gboolean on_ws_press(GtkWidget *w, GdkEventButton *ev, WsInd *i) {
     if (ev->type != GDK_BUTTON_PRESS) return FALSE;
     if (ev->button == 3) { ws_popup_menu(i, ev); return TRUE; }
+    if (ev->button == 1 && i->shell && i->shell->mode == LAYOUT_MACOS && i->shell->gnome_style) {
+        start_menu_open_from_dock(i->shell, dock_window_launchpad_btn());   /* GNOME: the pill opens the overview */
+        return TRUE;
+    }
     if (ev->button == 1) {
         gint wx = 0, wy = 0;
         gtk_widget_translate_coordinates(w, i->area, (gint)ev->x, (gint)ev->y, &wx, &wy);

@@ -171,6 +171,8 @@ static GAppInfo *find_app_info_for_key(const gchar *key_or_desktop) {
     return found;
 }
 
+GAppInfo *taskbar_find_app_info(const gchar *key) { return find_app_info_for_key(key); }
+
 static AppGroupItem *find_matching_group_for_window(TaskbarWidget *tb, const gchar *win_norm_key) {
     if (!tb || !tb->groups || !win_norm_key) return NULL;
 
@@ -647,6 +649,18 @@ static void refresh_group_visuals(AppGroupItem *grp) {
             gtk_widget_set_valign(child, GTK_ALIGN_CENTER);
             gtk_widget_set_vexpand(child, TRUE);
         }
+    } else if (grp->tb->shell && grp->tb->shell->mode == LAYOUT_MACOS && grp->tb->shell->dock_style == 1 &&
+               grp->tb->shell->dock_pos != DOCK_POS_BOTTOM) {
+        /* Ubuntu dock: each button is a full-width row of the strip, so the whole row clicks */
+        gtk_widget_set_halign(grp->button, GTK_ALIGN_FILL);
+        gtk_widget_set_valign(grp->button, GTK_ALIGN_CENTER);
+        GtkWidget *child = gtk_bin_get_child(GTK_BIN(grp->button));
+        if (child) {
+            gtk_widget_set_margin_start(child, 0);
+            gtk_widget_set_margin_end(child, 0);
+            gtk_widget_set_margin_top(child, 4);
+            gtk_widget_set_margin_bottom(child, 4);
+        }
     } else if (grp->tb->shell && grp->tb->shell->mode == LAYOUT_MACOS) {
         if (grp->tb->shell->dock_pos == DOCK_POS_LEFT) {
             gtk_widget_set_halign(grp->button, GTK_ALIGN_START);
@@ -781,7 +795,7 @@ static gint64 g_preview_last_visible_us = 0;   /* to switch instantly between ic
 static void show_preview_now(AppGroupItem *grp) {
     GtkWidget *btn = grp->button;
     if (!grp->tb->shell || !grp->tb->shell->show_thumbnails || grp->windows == NULL || !btn) return;
-    if (grp->tb->shell->mode == LAYOUT_MACOS) return;   /* a real Dock shows only the name */
+    if (grp->tb->shell->mode == LAYOUT_MACOS && grp->tb->shell->dock_style != 1) return;   /* a macOS Dock shows only the name; the Ubuntu dock previews */
 
     if (grp->preview_timeout_id > 0) {
         g_source_remove(grp->preview_timeout_id);
@@ -798,7 +812,10 @@ static void show_preview_now(AppGroupItem *grp) {
     g_signal_connect(grp->preview_popover, "enter-notify-event", G_CALLBACK(on_preview_popover_enter), grp);
     g_signal_connect(grp->preview_popover, "leave-notify-event", G_CALLBACK(on_preview_popover_leave), grp);
 
-    GtkWidget *hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    /* a bar on the left / right edge (Ubuntu dock) stacks the cards top to bottom */
+    UltimateShell *psh = grp->tb->shell;
+    gboolean side_bar = (psh->mode == LAYOUT_MACOS && psh->dock_style == 1 && psh->dock_pos != DOCK_POS_BOTTOM);
+    GtkWidget *hbox = gtk_box_new(side_bar ? GTK_ORIENTATION_VERTICAL : GTK_ORIENTATION_HORIZONTAL, 8);
     gtk_container_set_border_width(GTK_CONTAINER(hbox), 8);
 
     gint shown = 0;
@@ -867,7 +884,23 @@ static void show_preview_now(AppGroupItem *grp) {
         gtk_box_pack_start(GTK_BOX(hbox), card_vbox, FALSE, FALSE, 4);
     }
 
-    gtk_container_add(GTK_CONTAINER(grp->preview_popover), hbox);
+    if (side_bar) {
+        /* many windows: the stack scrolls instead of running off the screen */
+        GdkRectangle wa = { 0, 0, 1920, 1080 };
+        GdkWindow *bw = gtk_widget_get_window(btn);
+        GdkMonitor *mon = bw ? gdk_display_get_monitor_at_window(gdk_display_get_default(), bw) : NULL;
+        if (!mon) mon = gdk_display_get_primary_monitor(gdk_display_get_default());
+        if (mon) gdk_monitor_get_workarea(mon, &wa);
+        GtkWidget *sc = gtk_scrolled_window_new(NULL, NULL);
+        gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(sc), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+        gtk_scrolled_window_set_propagate_natural_height(GTK_SCROLLED_WINDOW(sc), TRUE);
+        gtk_scrolled_window_set_propagate_natural_width(GTK_SCROLLED_WINDOW(sc), TRUE);
+        gtk_scrolled_window_set_max_content_height(GTK_SCROLLED_WINDOW(sc), MAX(200, wa.height - 24));
+        gtk_container_add(GTK_CONTAINER(sc), hbox);
+        gtk_container_add(GTK_CONTAINER(grp->preview_popover), sc);
+    } else {
+        gtk_container_add(GTK_CONTAINER(grp->preview_popover), hbox);
+    }
     gtk_widget_show_all(grp->preview_popover);
     shell_reposition_popup_window((GtkToggleButton *)btn, grp->preview_popover);
     g_preview_last_visible_us = g_get_monotonic_time();
@@ -895,7 +928,7 @@ static gboolean on_icon_enter_notify(GtkWidget *btn, GdkEventCrossing *ev, AppGr
     }
 
     if (!grp->tb->shell || !grp->tb->shell->show_thumbnails || grp->windows == NULL) return FALSE;
-    if (grp->tb->shell->mode == LAYOUT_MACOS) return FALSE;   /* a real Dock shows only the name */
+    if (grp->tb->shell->mode == LAYOUT_MACOS && grp->tb->shell->dock_style != 1) return FALSE;   /* a macOS Dock shows only the name */
     if (grp->preview_show_id) { g_source_remove(grp->preview_show_id); grp->preview_show_id = 0; }
 
     /* A preview was open a moment ago (moving along the taskbar): switch instantly */
@@ -991,10 +1024,13 @@ static void on_group_btn_clicked(GtkButton *btn, AppGroupItem *grp) {
 
     guint count = g_list_length(grp->windows);
 
-    /* Trigger macOS Dock Parabolic Bounce (type 2 = multi-hop launch, type 1 = single activation hop) */
-    grp->click_anim_start_us = g_get_monotonic_time();
-    grp->click_anim_type = (count == 0) ? 2 : 1;
-    ensure_taskbar_anim_timer(grp->tb);
+    /* Trigger macOS Dock Parabolic Bounce (type 2 = multi-hop launch, type 1 = single activation hop).
+       The Ubuntu dock uses the taskbar's press animation instead. */
+    if (!(grp->tb->shell && grp->tb->shell->mode == LAYOUT_MACOS && grp->tb->shell->dock_style == 1)) {
+        grp->click_anim_start_us = g_get_monotonic_time();
+        grp->click_anim_type = (count == 0) ? 2 : 1;
+        ensure_taskbar_anim_timer(grp->tb);
+    }
 
     if (count == 0) {
         if (grp->pinned_app) shell_launch_app_info(grp->pinned_app);
@@ -1574,7 +1610,9 @@ gint taskbar_collect_dock_render_items(DockRenderItem *out_items, gint max_items
         out_items[count].is_pinned       = grp->is_pinned;
         out_items[count].needs_attention = grp->needs_attention;
         out_items[count].win_count       = w_cnt;
-        out_items[count].bounce_offset   = grp->bounce_offset;
+        /* the Ubuntu dock has no room for hops: urgent apps get the glow / pulse indicator only */
+        out_items[count].bounce_offset   = (g_taskbar->shell && g_taskbar->shell->dock_style == 1) ? 0.0 : grp->bounce_offset;
+        out_items[count].press_scale     = (grp->press_scale > 0.1) ? grp->press_scale : 1.0;
         out_items[count].title           = grp->display_title;
         out_items[count].le_count        = group_le_count_shown(grp) ? grp->le.count : 0;
         out_items[count].le_progress     = group_progress(grp);
@@ -1584,9 +1622,18 @@ gint taskbar_collect_dock_render_items(DockRenderItem *out_items, gint max_items
     return count;
 }
 
+GtkAlign taskbar_dock_halign(UltimateShell *shell) {
+    if (shell->dock_pos == DOCK_POS_BOTTOM)
+        return (shell->dock_full_width && shell->dock_full_width_layout == 3) ? GTK_ALIGN_START : GTK_ALIGN_CENTER;
+    if (shell->dock_style == 1) return GTK_ALIGN_FILL;          /* Ubuntu dock: buttons span the strip */
+    return shell->dock_pos == DOCK_POS_LEFT ? GTK_ALIGN_START : GTK_ALIGN_END;   /* along the screen edge, like the icons */
+}
+
 void taskbar_update_icon_sizes(UltimateShell *shell) {
     if (!g_taskbar) return;
-    if (shell->tb_align == TASKBAR_ALIGN_LEFT) {
+    if (shell->mode == LAYOUT_MACOS) {
+        gtk_widget_set_halign(g_taskbar->box, taskbar_dock_halign(shell));
+    } else if (shell->tb_align == TASKBAR_ALIGN_LEFT) {
         gtk_widget_set_halign(g_taskbar->box, GTK_ALIGN_START);
     } else {
         gtk_widget_set_halign(g_taskbar->box, GTK_ALIGN_CENTER);

@@ -247,11 +247,31 @@ static void update_panel(ClockWidget *cw, GDateTime *now) {
             g_free(one);
             gtk_widget_hide(cw->panel_date_lbl);
         } else {
-            set_label_markup(cw->panel_time_lbl, time_pt, tw, t);
-            set_label_markup(cw->panel_date_lbl, date_pt, dw, d);
             gboolean date_top = (sh->clock_format == CLOCK_FMT_DATE_TOP);
-            gtk_box_reorder_child(GTK_BOX(cw->panel_box), cw->panel_date_lbl, date_top ? 0 : 1);
-            gtk_widget_show(cw->panel_date_lbl);
+            gint sp = CLAMP(sh->clock_line_spacing, -8, 12);
+            if (sp < 0) {
+                /* Tighter lines: one label, the second line with a smaller Pango line height.
+                   (A negative widget margin made GTK warn on every update.) */
+                gint second_pt = date_top ? time_pt : date_pt;
+                gdouble line_px = second_pt * 96.0 / 72.0 * 1.2;
+                gdouble lh = CLAMP(1.0 + 2.0 * sp / line_px, 0.4, 1.0);
+                gchar *et = g_markup_escape_text(t ? t : "", -1);
+                gchar *ed = g_markup_escape_text(d ? d : "", -1);
+                gchar *mt = g_strdup_printf("<span font_desc='%d' weight='%s'>%s</span>", time_pt, tw, et);
+                gchar *md = g_strdup_printf("<span font_desc='%d' weight='%s'>%s</span>", date_pt, dw, ed);
+                gchar lhs[G_ASCII_DTOSTR_BUF_SIZE];
+                g_ascii_formatd(lhs, sizeof lhs, "%.2f", lh);
+                gchar *mk = g_strdup_printf("%s\n<span line_height='%s'>%s</span>",
+                                            date_top ? md : mt, lhs, date_top ? mt : md);
+                gtk_label_set_markup(GTK_LABEL(cw->panel_time_lbl), mk);
+                g_free(mk); g_free(mt); g_free(md); g_free(et); g_free(ed);
+                gtk_widget_hide(cw->panel_date_lbl);
+            } else {
+                set_label_markup(cw->panel_time_lbl, time_pt, tw, t);
+                set_label_markup(cw->panel_date_lbl, date_pt, dw, d);
+                gtk_box_reorder_child(GTK_BOX(cw->panel_box), cw->panel_date_lbl, date_top ? 0 : 1);
+                gtk_widget_show(cw->panel_date_lbl);
+            }
         }
         gtk_widget_show(cw->panel_time_lbl);
         g_free(d);
@@ -259,8 +279,6 @@ static void update_panel(ClockWidget *cw, GDateTime *now) {
     /* line spacing (negative pulls the two lines together) */
     gint sp = CLAMP(sh->clock_line_spacing, -8, 12);
     gtk_box_set_spacing(GTK_BOX(cw->panel_box), MAX(0, sp));
-    gtk_widget_set_margin_top(cw->panel_date_lbl, sp < 0 && sh->clock_format == CLOCK_FMT_TIME_TOP ? sp : 0);
-    gtk_widget_set_margin_bottom(cw->panel_date_lbl, sp < 0 && sh->clock_format == CLOCK_FMT_DATE_TOP ? sp : 0);
 
     gchar *tip = g_date_time_format(now, "%A, %-d %B %Y");
     gtk_widget_set_tooltip_text(cw->btn, tip);
@@ -561,6 +579,16 @@ void clock_widget_rebuild_style(UltimateShell *shell) {
         gtk_box_pack_start(GTK_BOX(lfoot), gtk_label_new("Do Not Disturb"), FALSE, FALSE, 0);
         cw->dnd_switch = gtk_switch_new();
         gtk_switch_set_active(GTK_SWITCH(cw->dnd_switch), notifications_get_dnd());
+        gtk_widget_set_valign(cw->dnd_switch, GTK_ALIGN_CENTER);   /* a compact switch, not stretched to the footer */
+        {
+            GtkCssProvider *cp = gtk_css_provider_new();
+            gtk_css_provider_load_from_data(cp,
+                "switch { min-height: 18px; min-width: 36px; padding: 0; margin: 0; }"
+                "switch slider { min-width: 16px; min-height: 16px; margin: 1px; }", -1, NULL);
+            gtk_style_context_add_provider(gtk_widget_get_style_context(cw->dnd_switch),
+                                           GTK_STYLE_PROVIDER(cp), GTK_STYLE_PROVIDER_PRIORITY_USER + 140);
+            g_object_unref(cp);
+        }
         g_signal_connect(cw->dnd_switch, "notify::active", G_CALLBACK(on_dnd_switch), cw);
         gtk_box_pack_start(GTK_BOX(lfoot), cw->dnd_switch, FALSE, FALSE, 0);
         GtkWidget *clr = gtk_button_new_with_label("Clear");
@@ -626,9 +654,27 @@ static void on_clock_toggled(GtkToggleButton *btn, ClockWidget *cw) {
         if (cw->notif_list) fill_notification_list(cw);
         if (cw->dnd_switch) gtk_switch_set_active(GTK_SWITCH(cw->dnd_switch), notifications_get_dnd());
     }
+    /* GNOME mode: the clock sits in the middle, so its popup opens centred under it */
+    g_object_set_data(G_OBJECT(cw->popup_win), "center-on-button",
+                      (cw->shell && cw->shell->mode == LAYOUT_MACOS && cw->shell->gnome_style) ? GINT_TO_POINTER(1) : NULL);
     shell_toggle_popup_window(btn, cw->popup_win);
     clock_tick(cw);                                         /* header now; seconds ticking while open */
 }
+
+/* After a panel restart the label is first measured before the panel's font/CSS
+   is in place, leaving the two-line clock off-centre until something re-lays it out
+   (a click). Re-measure once the button is on screen and again whenever its style changes. */
+static gboolean clock_relayout_idle(gpointer data) {
+    ClockWidget *cw = data;
+    GDateTime *now = clock_now(cw);
+    update_panel(cw, now);
+    g_date_time_unref(now);
+    gtk_widget_queue_resize(cw->panel_time_lbl);
+    gtk_widget_queue_resize(cw->btn);
+    return G_SOURCE_REMOVE;
+}
+static void on_clock_btn_map(GtkWidget *w, gpointer data) { g_idle_add(clock_relayout_idle, data); }
+static void on_clock_lbl_style(GtkWidget *w, gpointer data) { gtk_widget_queue_resize(w); }
 
 GtkWidget *clock_widget_new(UltimateShell *shell) {
     ClockWidget *cw = g_new0(ClockWidget, 1);
@@ -661,5 +707,7 @@ GtkWidget *clock_widget_new(UltimateShell *shell) {
 
     clock_widget_rebuild_style(shell);
     g_signal_connect(cw->btn, "toggled", G_CALLBACK(on_clock_toggled), cw);
+    g_signal_connect(cw->btn, "map", G_CALLBACK(on_clock_btn_map), cw);
+    g_signal_connect(cw->panel_time_lbl, "style-updated", G_CALLBACK(on_clock_lbl_style), NULL);
     return cw->btn;
 }

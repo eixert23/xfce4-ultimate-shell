@@ -141,7 +141,9 @@ static GtkWidget *gm_overflow_item(GtkWidget *bar, gboolean create) {
     GtkWidget *sub = gtk_menu_new();
     gtk_style_context_add_class(gtk_widget_get_style_context(sub), "ultimate-themed-menu");
     gtk_menu_item_set_submenu(GTK_MENU_ITEM(ovf), sub);
-    g_object_set_data(G_OBJECT(bar), "gm-overflow-item", ovf);
+    /* the bar owns a reference: the » item is taken off the bar whenever everything fits,
+       and must stay alive for the next fit (it was freed there before - a stale pointer) */
+    g_object_set_data_full(G_OBJECT(bar), "gm-overflow-item", g_object_ref_sink(ovf), g_object_unref);
     return ovf;
 }
 
@@ -180,7 +182,7 @@ static void gm_fit_menubar(GlobalMenuWidget *gm) {
         g_list_free(items);
         return;
     }
-    if (!ovf) { ovf = gm_overflow_item(bar, TRUE); g_object_ref(ovf); }
+    if (!ovf) { ovf = gm_overflow_item(bar, TRUE); g_object_ref(ovf); }   /* balanced by the unref below */
     sub = gtk_menu_item_get_submenu(GTK_MENU_ITEM(ovf));
     gint ow = gm_item_width(ovf) + 6;
     gint used = 0;
@@ -516,17 +518,17 @@ static void apply_clean_menubar_css(GtkWidget *menubar) {
             "  background-image: none;"
             "  color: @theme_fg_color;"
             "}"
-            "menu.ultimate-themed-menu menuitem:hover label,"
-            ".ultimate-themed-menu menuitem:hover label {"
+            "menu.ultimate-themed-menu menuitem:hover > label,"
+            ".ultimate-themed-menu menuitem:hover > label {"
             "  color: @theme_fg_color;"
             "  opacity: 1.0;"
             "}"
             "menu.ultimate-themed-menu menuitem:disabled,"
             ".ultimate-themed-menu menuitem:disabled,"
-            "menu.ultimate-themed-menu menuitem:disabled label,"
-            ".ultimate-themed-menu menuitem:disabled label,"
-            "menu.ultimate-themed-menu menuitem:backdrop:disabled label,"
-            ".ultimate-themed-menu menuitem:backdrop:disabled label {"
+            "menu.ultimate-themed-menu menuitem:disabled > label,"
+            ".ultimate-themed-menu menuitem:disabled > label,"
+            "menu.ultimate-themed-menu menuitem:backdrop:disabled > label,"
+            ".ultimate-themed-menu menuitem:backdrop:disabled > label {"
             "  color: alpha(@theme_fg_color, 0.45);"
             "  opacity: 1.0;"
             "  background: transparent;"
@@ -2482,6 +2484,19 @@ static void on_bus_acquired(GDBusConnection *connection, const gchar *name, gpoi
     }
 
     update_menu_for_active_window(gm, TRUE);
+}
+
+WnckWindow *global_menu_active_app_window(void) { return g_gm ? get_valid_active_win(g_gm) : NULL; }
+const gchar *global_menu_app_name(WnckWindow *win) {
+    if (win && is_shell_settings_window(win)) return "Ultimate Shell";
+    return app_display_name_for_window(win);
+}
+void global_menu_quit_app(WnckWindow *win) {
+    if (!g_gm || !win) return;
+    guint32 ts = gtk_get_current_event_time();
+    GList *ws = app_windows(g_gm, win);
+    for (GList *l = ws; l; l = l->next) wnck_window_close(WNCK_WINDOW(l->data), ts);
+    g_list_free(ws);
 }
 
 void global_menu_set_enabled(gboolean enabled) {

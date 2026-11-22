@@ -12,6 +12,7 @@
 #include "win-fill.h"
 #include "workspace-indicator.h"
 #include "notifications.h"
+#include "app-title.h"
 #include <string.h>
 #include <glib/gstdio.h>
 
@@ -304,8 +305,8 @@ void shell_apply_theme(UltimateShell *shell) {
         MAX(6, dock_ph),
         MAX(1, dock_ph / 3), ico_sh,
         wck_pad / 2,
-        (shell->start_style_cat_weight[CLAMP((gint)shell->start_style, 0, 4)] >= 700) ? 700 :
-        ((shell->start_style_cat_weight[CLAMP((gint)shell->start_style, 0, 4)] >= 500) ? 600 : 400)
+        (shell->start_style_cat_weight[CLAMP((gint)shell->start_style, 0, START_STYLE_COUNT - 1)] >= 700) ? 700 :
+        ((shell->start_style_cat_weight[CLAMP((gint)shell->start_style, 0, START_STYLE_COUNT - 1)] >= 500) ? 600 : 400)
     );
     gchar *full_css = g_strconcat(css, dock_extra_css, NULL);
     gtk_css_provider_load_from_data(shell->dynamic_css, full_css, -1, NULL);
@@ -395,6 +396,9 @@ static void save_settings_to_xfconf(UltimateShell *shell) {
 
     /* Start Menu & Per-Style Settings */
     xfconf_channel_set_int(shell->channel, "/plugins/ultimateshell/start_style", (gint)shell->start_style);
+    xfconf_channel_set_string(shell->channel, "/plugins/ultimateshell/win10_tile_sizes", shell->win10_tile_sizes ? shell->win10_tile_sizes : "");
+    xfconf_channel_set_string(shell->channel, "/plugins/ultimateshell/win10_tile_pos", shell->win10_tile_pos ? shell->win10_tile_pos : "");
+    xfconf_channel_set_string(shell->channel, "/plugins/ultimateshell/win10_groups", shell->win10_groups ? shell->win10_groups : "Pinned");
     xfconf_channel_set_int(shell->channel, "/plugins/ultimateshell/start_btn_mode", (gint)shell->start_btn_mode);
     xfconf_channel_set_string(shell->channel, "/plugins/ultimateshell/start_btn_label", shell->start_btn_label ? shell->start_btn_label : "Start");
     xfconf_channel_set_string(shell->channel, "/plugins/ultimateshell/start_btn_icon", shell->start_btn_icon ? shell->start_btn_icon : "");
@@ -404,12 +408,14 @@ static void save_settings_to_xfconf(UltimateShell *shell) {
     xfconf_channel_set_bool(shell->channel, "/plugins/ultimateshell/start_show_recommended", shell->start_show_recommended);
     xfconf_channel_set_bool(shell->channel, "/plugins/ultimateshell/start_recommend_files", shell->start_recommend_files);
     xfconf_channel_set_bool(shell->channel, "/plugins/ultimateshell/start_whisker_grid", shell->start_whisker_grid);
+    xfconf_channel_set_bool(shell->channel, "/plugins/ultimateshell/win10_show_tiles", shell->win10_show_tiles);
     xfconf_channel_set_bool(shell->channel, "/plugins/ultimateshell/start_show_user_header", shell->start_show_user_header);
     xfconf_channel_set_bool(shell->channel, "/plugins/ultimateshell/start_show_lock", shell->start_show_lock);
     xfconf_channel_set_bool(shell->channel, "/plugins/ultimateshell/start_show_logout", shell->start_show_logout);
     xfconf_channel_set_bool(shell->channel, "/plugins/ultimateshell/start_show_restart", shell->start_show_restart);
     xfconf_channel_set_bool(shell->channel, "/plugins/ultimateshell/start_show_shutdown", shell->start_show_shutdown);
     xfconf_channel_set_int(shell->channel, "/plugins/ultimateshell/start_style_fs_rows", shell->start_style_fs_rows);
+    xfconf_channel_set_int(shell->channel, "/plugins/ultimateshell/start_gnome_rows", shell->start_gnome_rows);
     xfconf_channel_set_bool(shell->channel, "/plugins/ultimateshell/win7_show_pictures", shell->win7_show_pictures);
     xfconf_channel_set_bool(shell->channel, "/plugins/ultimateshell/win7_show_music", shell->win7_show_music);
     xfconf_channel_set_bool(shell->channel, "/plugins/ultimateshell/win7_show_videos", shell->win7_show_videos);
@@ -417,7 +423,7 @@ static void save_settings_to_xfconf(UltimateShell *shell) {
     xfconf_channel_set_bool(shell->channel, "/plugins/ultimateshell/win7_show_terminal", shell->win7_show_terminal);
     xfconf_channel_set_int(shell->channel, "/plugins/ultimateshell/win7_places_weight", shell->win7_places_weight);
 
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < START_STYLE_COUNT; i++) {
         gchar key[128];
         g_snprintf(key, sizeof(key), "/plugins/ultimateshell/start_w_%d", i);
         xfconf_channel_set_int(shell->channel, key, shell->start_style_w[i]);
@@ -454,8 +460,13 @@ static void save_settings_to_xfconf(UltimateShell *shell) {
     xfconf_channel_set_bool(shell->channel, "/plugins/ultimateshell/tray_hide_new_default", shell->tray_hide_new_default);
     xfconf_channel_set_bool(shell->channel, "/plugins/ultimateshell/tray_ibus_modern", shell->tray_ibus_modern);
     xfconf_channel_set_int(shell->channel, "/plugins/ultimateshell/anim_mode", shell->anim_mode);
+    xfconf_channel_set_int(shell->channel, "/plugins/ultimateshell/anim_style", shell->anim_style);
     xfconf_channel_set_int(shell->channel, "/plugins/ultimateshell/anim_speed", shell->anim_speed);
     xfconf_channel_set_bool(shell->channel, "/plugins/ultimateshell/tray_menu_is_primary", shell->tray_menu_is_primary);
+    xfconf_channel_set_bool(shell->channel, "/plugins/ultimateshell/tray_quick_settings", shell->tray_quick_settings);
+    xfconf_channel_set_bool(shell->channel, "/plugins/ultimateshell/tray_qs_bluetooth", shell->tray_qs_bluetooth);
+    xfconf_channel_set_bool(shell->channel, "/plugins/ultimateshell/gnome_style", shell->gnome_style);
+    xfconf_channel_set_bool(shell->channel, "/plugins/ultimateshell/super_key_start", shell->super_key_start);
     xfconf_channel_set_bool(shell->channel, "/plugins/ultimateshell/tray_request_symbolic", shell->tray_request_symbolic);
     xfconf_channel_set_bool(shell->channel, "/plugins/ultimateshell/tray_enable_network", shell->tray_enable_network);
     xfconf_channel_set_bool(shell->channel, "/plugins/ultimateshell/tray_enable_audio", shell->tray_enable_audio);
@@ -477,6 +488,7 @@ static void save_settings_to_xfconf(UltimateShell *shell) {
     xfconf_channel_set_int(shell->channel, "/plugins/ultimateshell/dock_opacity", shell->dock_opacity);
     xfconf_channel_set_bool(shell->channel, "/plugins/ultimateshell/dock_magnify", shell->dock_magnify);
     xfconf_channel_set_bool(shell->channel, "/plugins/ultimateshell/dock_full_width", shell->dock_full_width);
+    xfconf_channel_set_int(shell->channel, "/plugins/ultimateshell/dock_style", shell->dock_style);
     xfconf_channel_set_int(shell->channel, "/plugins/ultimateshell/dock_full_width_layout", shell->dock_full_width_layout);
     xfconf_channel_set_bool(shell->channel, "/plugins/ultimateshell/dock_show_trash", shell->dock_show_trash);
     xfconf_channel_set_int(shell->channel, "/plugins/ultimateshell/dock_border_w", shell->dock_border_w);
@@ -592,6 +604,13 @@ static void load_settings_from_xfconf(UltimateShell *shell) {
 
     /* Start Menu & Per-Style Settings */
     shell->start_style = shell->channel ? (StartMenuStyle)xfconf_channel_get_int(shell->channel, "/plugins/ultimateshell/start_style", START_STYLE_WIN11) : START_STYLE_WIN11;
+    shell->start_style = (StartMenuStyle)CLAMP((gint)shell->start_style, 0, START_STYLE_COUNT - 1);
+    g_free(shell->win10_tile_sizes);
+    shell->win10_tile_sizes = shell->channel ? xfconf_channel_get_string(shell->channel, "/plugins/ultimateshell/win10_tile_sizes", "") : g_strdup("");
+    g_free(shell->win10_tile_pos);
+    shell->win10_tile_pos = shell->channel ? xfconf_channel_get_string(shell->channel, "/plugins/ultimateshell/win10_tile_pos", "") : g_strdup("");
+    g_free(shell->win10_groups);
+    shell->win10_groups = shell->channel ? xfconf_channel_get_string(shell->channel, "/plugins/ultimateshell/win10_groups", "Pinned") : g_strdup("Pinned");
     shell->start_btn_mode = shell->channel ? (StartButtonMode)xfconf_channel_get_int(shell->channel, "/plugins/ultimateshell/start_btn_mode", START_BTN_MODE_ICON_ONLY) : START_BTN_MODE_ICON_ONLY;
     shell->start_btn_label = shell->channel ? xfconf_channel_get_string(shell->channel, "/plugins/ultimateshell/start_btn_label", "Start") : g_strdup("Start");
     shell->start_btn_icon = shell->channel ? xfconf_channel_get_string(shell->channel, "/plugins/ultimateshell/start_btn_icon", "") : g_strdup("");
@@ -601,12 +620,14 @@ static void load_settings_from_xfconf(UltimateShell *shell) {
     shell->start_show_recommended = shell->channel ? xfconf_channel_get_bool(shell->channel, "/plugins/ultimateshell/start_show_recommended", FALSE) : FALSE;
     shell->start_recommend_files = shell->channel ? xfconf_channel_get_bool(shell->channel, "/plugins/ultimateshell/start_recommend_files", TRUE) : TRUE;
     shell->start_whisker_grid = shell->channel ? xfconf_channel_get_bool(shell->channel, "/plugins/ultimateshell/start_whisker_grid", FALSE) : FALSE;
+    shell->win10_show_tiles = shell->channel ? xfconf_channel_get_bool(shell->channel, "/plugins/ultimateshell/win10_show_tiles", TRUE) : TRUE;
     shell->start_show_user_header = shell->channel ? xfconf_channel_get_bool(shell->channel, "/plugins/ultimateshell/start_show_user_header", TRUE) : TRUE;
     shell->start_show_lock = shell->channel ? xfconf_channel_get_bool(shell->channel, "/plugins/ultimateshell/start_show_lock", TRUE) : TRUE;
     shell->start_show_logout = shell->channel ? xfconf_channel_get_bool(shell->channel, "/plugins/ultimateshell/start_show_logout", TRUE) : TRUE;
     shell->start_show_restart = shell->channel ? xfconf_channel_get_bool(shell->channel, "/plugins/ultimateshell/start_show_restart", TRUE) : TRUE;
     shell->start_show_shutdown = shell->channel ? xfconf_channel_get_bool(shell->channel, "/plugins/ultimateshell/start_show_shutdown", TRUE) : TRUE;
     shell->start_style_fs_rows = shell->channel ? xfconf_channel_get_int(shell->channel, "/plugins/ultimateshell/start_style_fs_rows", 4) : 4;
+    shell->start_gnome_rows = shell->channel ? xfconf_channel_get_int(shell->channel, "/plugins/ultimateshell/start_gnome_rows", 3) : 3;
     shell->start_favorites = shell->channel ? xfconf_channel_get_string(shell->channel, "/plugins/ultimateshell/start_favorites", "xfce4-terminal.desktop;thunar.desktop;firefox.desktop;xfce4-settings-manager.desktop") : g_strdup("xfce4-terminal.desktop;thunar.desktop;firefox.desktop;xfce4-settings-manager.desktop");
     shell->win7_show_pictures = shell->channel ? xfconf_channel_get_bool(shell->channel, "/plugins/ultimateshell/win7_show_pictures", TRUE) : TRUE;
     shell->win7_show_music = shell->channel ? xfconf_channel_get_bool(shell->channel, "/plugins/ultimateshell/win7_show_music", TRUE) : TRUE;
@@ -615,9 +636,9 @@ static void load_settings_from_xfconf(UltimateShell *shell) {
     shell->win7_show_terminal = shell->channel ? xfconf_channel_get_bool(shell->channel, "/plugins/ultimateshell/win7_show_terminal", TRUE) : TRUE;
     shell->win7_places_weight = shell->channel ? xfconf_channel_get_int(shell->channel, "/plugins/ultimateshell/win7_places_weight", 600) : 600;
 
-    gint def_w[5] = { 420, 520, 600, 540, 900 };
-    gint def_h[5] = { 520, 540, 620, 540, 680 };
-    for (int i = 0; i < 5; i++) {
+    gint def_w[START_STYLE_COUNT] = { 420, 520, 600, 540, 900, 760, 900 };
+    gint def_h[START_STYLE_COUNT] = { 520, 540, 620, 540, 680, 600, 680 };
+    for (int i = 0; i < START_STYLE_COUNT; i++) {
         gchar key[128];
         g_snprintf(key, sizeof(key), "/plugins/ultimateshell/start_w_%d", i);
         shell->start_style_w[i] = shell->channel ? xfconf_channel_get_int(shell->channel, key, def_w[i]) : def_w[i];
@@ -634,11 +655,13 @@ static void load_settings_from_xfconf(UltimateShell *shell) {
         g_snprintf(key, sizeof(key), "/plugins/ultimateshell/start_list_icon_%d", i);
         shell->start_style_list_icon[i] = shell->channel ? xfconf_channel_get_int(shell->channel, key, 28) : 28;
         g_snprintf(key, sizeof(key), "/plugins/ultimateshell/start_grid_icon_%d", i);
-        shell->start_style_grid_icon[i] = shell->channel ? xfconf_channel_get_int(shell->channel, key, 42) : 42;
+        gint def_gi = (i == START_STYLE_GNOME) ? 48 : 42;   /* GNOME App Grid: 8 × 3 of 48 px icons */
+        shell->start_style_grid_icon[i] = shell->channel ? xfconf_channel_get_int(shell->channel, key, def_gi) : def_gi;
         g_snprintf(key, sizeof(key), "/plugins/ultimateshell/start_label_pt_%d", i);
         shell->start_style_label_pt[i] = shell->channel ? xfconf_channel_get_int(shell->channel, key, 10) : 10;
         g_snprintf(key, sizeof(key), "/plugins/ultimateshell/start_grid_cols_%d", i);
-        shell->start_style_grid_cols[i] = shell->channel ? xfconf_channel_get_int(shell->channel, key, 6) : 6;
+        gint def_gc = (i == START_STYLE_GNOME) ? 8 : 6;
+        shell->start_style_grid_cols[i] = shell->channel ? xfconf_channel_get_int(shell->channel, key, def_gc) : def_gc;
         g_snprintf(key, sizeof(key), "/plugins/ultimateshell/start_cat_mode_%d", i);
         shell->start_style_cat_mode[i] = shell->channel ? (StartCatDisplayMode)xfconf_channel_get_int(shell->channel, key, START_CAT_DISPLAY_ICON_LABEL) : START_CAT_DISPLAY_ICON_LABEL;
         g_snprintf(key, sizeof(key), "/plugins/ultimateshell/start_search_pos_%d", i);
@@ -648,14 +671,31 @@ static void load_settings_from_xfconf(UltimateShell *shell) {
         g_snprintf(key, sizeof(key), "/plugins/ultimateshell/start_hover_cat_%d", i);
         shell->start_style_hover_cat[i] = shell->channel ? xfconf_channel_get_bool(shell->channel, key, TRUE) : TRUE;
     }
+    /* the first 0.4.1 test build saved the GNOME App Grid with the generic 6 columns / 42 px */
+    if (shell->channel && !xfconf_channel_get_bool(shell->channel, "/plugins/ultimateshell/start_gnome_defaults_set", FALSE)) {
+        shell->start_style_grid_cols[START_STYLE_GNOME] = 8;
+        shell->start_style_grid_icon[START_STYLE_GNOME] = 48;
+        xfconf_channel_set_bool(shell->channel, "/plugins/ultimateshell/start_gnome_defaults_set", TRUE);
+    }
+    if (shell->channel && !xfconf_channel_get_bool(shell->channel, "/plugins/ultimateshell/start_win10_defaults_set", FALSE)) {
+        shell->start_style_grid_cols[START_STYLE_WIN10] = 4;   /* medium tiles per row */
+        xfconf_channel_set_bool(shell->channel, "/plugins/ultimateshell/start_win10_defaults_set", TRUE);
+    }
 
     /* System Tray & Audio */
     shell->tray_show_all = shell->channel ? xfconf_channel_get_bool(shell->channel, "/plugins/ultimateshell/tray_show_all", FALSE) : FALSE;
     shell->tray_hide_new_default = shell->channel ? xfconf_channel_get_bool(shell->channel, "/plugins/ultimateshell/tray_hide_new_default", FALSE) : FALSE;
     shell->tray_ibus_modern = shell->channel ? xfconf_channel_get_bool(shell->channel, "/plugins/ultimateshell/tray_ibus_modern", TRUE) : TRUE;
     shell->anim_mode  = CLAMP(shell->channel ? xfconf_channel_get_int(shell->channel, "/plugins/ultimateshell/anim_mode", 1) : 1, 0, 2);
+    shell->anim_style = CLAMP(shell->channel ? xfconf_channel_get_int(shell->channel, "/plugins/ultimateshell/anim_style",
+                                                                     shell->anim_mode ? shell->anim_mode : 1) : 1, 1, 2);
+    if (shell->anim_mode != 0) shell->anim_mode = shell->anim_style;
     shell->anim_speed = CLAMP(shell->channel ? xfconf_channel_get_int(shell->channel, "/plugins/ultimateshell/anim_speed", 100) : 100, 50, 200);
     shell->tray_menu_is_primary = shell->channel ? xfconf_channel_get_bool(shell->channel, "/plugins/ultimateshell/tray_menu_is_primary", FALSE) : FALSE;
+    shell->tray_quick_settings = shell->channel ? xfconf_channel_get_bool(shell->channel, "/plugins/ultimateshell/tray_quick_settings", FALSE) : FALSE;
+    shell->tray_qs_bluetooth = shell->channel ? xfconf_channel_get_bool(shell->channel, "/plugins/ultimateshell/tray_qs_bluetooth", FALSE) : FALSE;
+    shell->gnome_style = shell->channel ? xfconf_channel_get_bool(shell->channel, "/plugins/ultimateshell/gnome_style", FALSE) : FALSE;
+    shell->super_key_start = shell->channel ? xfconf_channel_get_bool(shell->channel, "/plugins/ultimateshell/super_key_start", TRUE) : TRUE;
     shell->tray_request_symbolic = shell->channel ? xfconf_channel_get_bool(shell->channel, "/plugins/ultimateshell/tray_request_symbolic", FALSE) : FALSE;
     shell->tray_enable_network = shell->channel ? xfconf_channel_get_bool(shell->channel, "/plugins/ultimateshell/tray_enable_network", TRUE) : TRUE;
     shell->tray_enable_audio = shell->channel ? xfconf_channel_get_bool(shell->channel, "/plugins/ultimateshell/tray_enable_audio", TRUE) : TRUE;
@@ -697,6 +737,10 @@ static void load_settings_from_xfconf(UltimateShell *shell) {
     shell->dock_magnify = shell->channel ? xfconf_channel_get_bool(shell->channel, "/plugins/ultimateshell/dock_magnify", TRUE) : TRUE;
     shell->dock_full_width = shell->channel ? xfconf_channel_get_bool(shell->channel, "/plugins/ultimateshell/dock_full_width", FALSE) : FALSE;
     shell->dock_full_width_layout = shell->channel ? xfconf_channel_get_int(shell->channel, "/plugins/ultimateshell/dock_full_width_layout", 0) : 0;
+    shell->dock_style = shell->channel ? CLAMP(xfconf_channel_get_int(shell->channel, "/plugins/ultimateshell/dock_style", 0), 0, 1) : 0;
+    if (shell->dock_style == 1) {   /* Ubuntu dock: left edge, full height, no zoom */
+        shell->dock_pos = DOCK_POS_LEFT; shell->dock_full_width = TRUE; shell->dock_magnify = FALSE;
+    }
     shell->dock_show_trash = shell->channel ? xfconf_channel_get_bool(shell->channel, "/plugins/ultimateshell/dock_show_trash", TRUE) : TRUE;
     shell->dock_border_w = shell->channel ? xfconf_channel_get_int(shell->channel, "/plugins/ultimateshell/dock_border_w", 1) : 1;
     shell->dock_border_color = shell->channel ? xfconf_channel_get_string(shell->channel, "/plugins/ultimateshell/dock_border_color", "#3894FF") : g_strdup("#3894FF");
@@ -924,7 +968,6 @@ static UltimateShell *g_anim_shell = NULL;
 gint shell_anim_ms(gint base_ms) {
     if (!g_anim_shell || g_anim_shell->anim_mode == 0) return 0;
     gint ms = base_ms * CLAMP(g_anim_shell->anim_speed, 50, 200) / 100;
-    if (g_anim_shell->anim_mode == 1) ms = ms * 3 / 4;     /* subtle = a bit quicker */
     return MAX(ms, 1);
 }
 
@@ -945,15 +988,11 @@ static void shell_apply_animation_css(UltimateShell *shell) {
     if (!shell || shell->anim_mode == 0) {
         css = g_strdup("* { transition: none; }");
     } else {
-        gint ms = shell_anim_ms(shell->anim_mode == 2 ? 180 : 140);
+        gint ms = shell_anim_ms(140);
         css = g_strdup_printf(
             "button, menuitem, .ultimate-module-btn, .taskbar-item-btn, #ultimate-start-btn, #ultimate-clock-btn,"
-            " .winck-btn, .app-grid-tile, .ap-dot, .ap-icon-btn, scale slider, switch, switch slider {"
-            " transition-duration: %dms; transition-timing-function: ease-out; }"
-            "%s", ms,
-            shell->anim_mode == 2
-              ? ".ultimate-module-btn:active, .taskbar-item-btn:active, #ultimate-start-btn:active { -gtk-icon-transform: scale(0.88); }"
-              : "");
+            " .winck-btn, .app-grid-tile, .win10-tile, .ap-dot, .ap-icon-btn, scale slider, switch, switch slider {"
+            " transition-duration: %dms; transition-timing-function: ease-out; }", ms);
     }
     gtk_css_provider_load_from_data(prov, css, -1, NULL);
     g_free(css);
@@ -961,7 +1000,10 @@ static void shell_apply_animation_css(UltimateShell *shell) {
 
 typedef struct {
     GtkWidget *win;
-    gint fx, fy, dx, dy;
+    gint dx, dy;                 /* slide offset towards the bar (0 for Fade) */
+    gint bx, by;                 /* closing: where the popup sat when it started to close */
+    gdouble from;                /* closing: opacity at the start */
+    gboolean closing;
     gint64 start_us, dur_us;
     guint id;
 } PopupAnim;
@@ -970,6 +1012,23 @@ static gboolean popup_anim_tick(gpointer data) {
     PopupAnim *a = data;
     gdouble t = (gdouble)(g_get_monotonic_time() - a->start_us) / a->dur_us;
     if (t >= 1.0 || !gtk_widget_get_visible(a->win)) t = 1.0;
+
+    if (a->closing) {
+        gdouble e = t * t * t;                               /* ease-in cubic */
+        gtk_widget_set_opacity(a->win, a->from * (1.0 - e));
+        if (a->dx || a->dy)
+            gtk_window_move(GTK_WINDOW(a->win), a->bx + (gint)lround(a->dx * e), a->by + (gint)lround(a->dy * e));
+        if (t >= 1.0) {
+            GtkWidget *w = a->win;
+            a->id = 0;
+            g_object_set_data(G_OBJECT(w), "popup-anim", NULL);   /* frees a */
+            if (gtk_widget_get_visible(w)) gtk_widget_hide(w);
+            gtk_widget_set_opacity(w, 1.0);
+            return G_SOURCE_REMOVE;
+        }
+        return G_SOURCE_CONTINUE;
+    }
+
     gdouble e = 1.0 - pow(1.0 - t, 3.0);                 /* ease-out cubic */
     gtk_widget_set_opacity(a->win, e);
     /* Slide only towards a position the shell itself placed the popup at (read every frame,
@@ -995,31 +1054,80 @@ static void popup_anim_free(gpointer p) {
     g_free(a);
 }
 
-/* Popup entrance: fade in (needs compositing), Full also slides 8 px away from the bar */
+/* Slide style: offset pointing from the popup towards the bar it belongs to */
+static void popup_slide_offset(GtkWidget *win, GtkWidget *anchor, gint *dx, gint *dy) {
+    *dx = *dy = 0;
+    if (!g_anim_shell || g_anim_shell->anim_mode != 2) return;
+    if (GPOINTER_TO_INT(g_object_get_data(G_OBJECT(win), "is-fullscreen-start")) == 1) return;
+    GtkWidget *dock_btn = g_object_get_data(G_OBJECT(win), "dock-anchor-btn");
+    if (GTK_IS_WIDGET(dock_btn)) anchor = dock_btn;
+    if (!GTK_IS_WIDGET(anchor) || !gtk_widget_get_window(anchor)) return;
+    GtkWidget *top = gtk_widget_get_toplevel(anchor);
+    if (!gtk_widget_get_window(top)) return;
+    gint ax = 0, ay = 0;
+    gdk_window_get_origin(gtk_widget_get_window(top), &ax, &ay);
+    GdkMonitor *m = gdk_display_get_monitor_at_window(gdk_display_get_default(), gtk_widget_get_window(anchor));
+    GdkRectangle g = { 0, 0, 1920, 1080 };
+    if (m) gdk_monitor_get_geometry(m, &g);
+    gint tw = gtk_widget_get_allocated_width(top);
+    gint th = gtk_widget_get_allocated_height(top);
+    const gint D = 14;
+    if (tw >= th) *dy = (ay + th / 2 < g.y + g.height / 2) ? -D : D;   /* top bar: up, bottom bar: down */
+    else          *dx = (ax + tw / 2 < g.x + g.width / 2)  ? -D : D;   /* side bar */
+}
+
+/* Popup entrance: Fade = fade in; Slide = fade in while sliding out of the bar */
 static void on_popup_map_animate(GtkWidget *win, GtkWidget *anchor) {
     gint ms = shell_anim_ms(200);
     if (ms <= 0 || !shell_compositing_active()) { gtk_widget_set_opacity(win, 1.0); return; }
     PopupAnim *a = g_new0(PopupAnim, 1);
     a->win = win;
-    gboolean fullscreen = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(win), "is-fullscreen-start")) == 1;
-    if (g_anim_shell->anim_mode == 2 && !fullscreen && GTK_IS_WIDGET(anchor) && gtk_widget_get_window(anchor)) {
-        /* slide from the bar: which side is the bar on? */
-        gint ax = 0, ay = 0;
-        gdk_window_get_origin(gtk_widget_get_window(gtk_widget_get_toplevel(anchor)), &ax, &ay);
-        GdkMonitor *m = gdk_display_get_monitor_at_window(gdk_display_get_default(), gtk_widget_get_window(anchor));
-        GdkRectangle g = { 0, 0, 1920, 1080 };
-        if (m) gdk_monitor_get_geometry(m, &g);
-        gint tw = gtk_widget_get_allocated_width(gtk_widget_get_toplevel(anchor));
-        gint th = gtk_widget_get_allocated_height(gtk_widget_get_toplevel(anchor));
-        const gint D = 8;
-        if (tw >= th) a->dy = (ay + th / 2 < g.y + g.height / 2) ? -D : D;   /* top bar: from above */
-        else          a->dx = (ax + tw / 2 < g.x + g.width / 2)  ? -D : D;   /* side bar */
-    }
+    popup_slide_offset(win, anchor, &a->dx, &a->dy);
     a->start_us = g_get_monotonic_time();
     a->dur_us = (gint64)ms * 1000;
     gtk_widget_set_opacity(win, 0.0);
     a->id = g_timeout_add(15, popup_anim_tick, a);
     g_object_set_data_full(G_OBJECT(win), "popup-anim", a, popup_anim_free);
+}
+
+/* Close a shell popup: Fade = fade out; Slide = fade out while sliding back into the bar.
+   Instant when animations are off or without compositing. */
+void shell_popup_hide(GtkWidget *win) {
+    if (!GTK_IS_WIDGET(win) || !gtk_widget_get_visible(win)) return;
+    PopupAnim *cur = g_object_get_data(G_OBJECT(win), "popup-anim");
+    if (cur && cur->closing) return;                      /* already on its way out */
+    gint ms = shell_anim_ms(160);
+    if (ms <= 0 || !shell_compositing_active() || !gtk_widget_get_mapped(win)) {
+        g_object_set_data(G_OBJECT(win), "popup-anim", NULL);
+        gtk_widget_hide(win);
+        gtk_widget_set_opacity(win, 1.0);
+        return;
+    }
+    /* a popup can ask for a CSS class while it closes (full-screen grids: icons shrink away) */
+    const gchar *cc = g_object_get_data(G_OBJECT(win), "close-class");
+    if (cc) gtk_style_context_add_class(gtk_widget_get_style_context(win), cc);
+    PopupAnim *a = g_new0(PopupAnim, 1);
+    a->win = win;
+    a->closing = TRUE;
+    a->from = gtk_widget_get_opacity(win);
+    popup_slide_offset(win, g_object_get_data(G_OBJECT(win), "toggle-btn"), &a->dx, &a->dy);
+    gtk_window_get_position(GTK_WINDOW(win), &a->bx, &a->by);
+    a->start_us = g_get_monotonic_time();
+    a->dur_us = (gint64)ms * 1000;
+    a->id = g_timeout_add(15, popup_anim_tick, a);
+    g_object_set_data_full(G_OBJECT(win), "popup-anim", a, popup_anim_free);   /* replaces an opening one */
+}
+
+/* Opening again while it is still closing: stop the close and show it fully */
+void shell_popup_cancel_close(GtkWidget *win) {
+    if (!GTK_IS_WIDGET(win)) return;
+    PopupAnim *cur = g_object_get_data(G_OBJECT(win), "popup-anim");
+    if (cur && cur->closing) {
+        g_object_set_data(G_OBJECT(win), "popup-anim", NULL);
+        gtk_widget_set_opacity(win, 1.0);
+        const gchar *cc = g_object_get_data(G_OBJECT(win), "close-class");
+        if (cc) gtk_style_context_remove_class(gtk_widget_get_style_context(win), cc);
+    }
 }
 
 /* placed elsewhere next time (dock anchor, fullscreen): don't slide to a stale spot */
@@ -1053,6 +1161,8 @@ static void on_popup_unmap_forget(GtkWidget *win, gpointer d) {
     g_object_set_data(G_OBJECT(win), "anim-ty", NULL);
     g_object_set_data(G_OBJECT(win), "popup-anim", NULL);
     gtk_widget_set_opacity(win, 1.0);
+    const gchar *cc = g_object_get_data(G_OBJECT(win), "close-class");
+    if (cc) gtk_style_context_remove_class(gtk_widget_get_style_context(win), cc);
 }
 
 static gboolean on_popup_focus_out(GtkWidget *popup_win, GdkEventFocus *event, GtkToggleButton *btn) {
@@ -1065,11 +1175,20 @@ static gboolean on_popup_focus_out(GtkWidget *popup_win, GdkEventFocus *event, G
     *last_hide = g_get_monotonic_time();
     g_object_set_data_full(G_OBJECT(popup_win), "last-focus-hide-us", last_hide, g_free);
 
-    gtk_widget_hide(popup_win);
+    shell_popup_hide(popup_win);
     if (GTK_IS_TOGGLE_BUTTON(btn) && gtk_toggle_button_get_active(btn)) {
         gtk_toggle_button_set_active(btn, FALSE);
     }
     return FALSE;
+}
+
+/* Esc closes any shell popup (clock & calendar, tray popups, Quick Settings, ...). Runs after
+   the popup's own key handling, so a popup that uses Esc itself (clear a search) still does. */
+static gboolean on_popup_escape(GtkWidget *popup_win, GdkEventKey *ev, GtkToggleButton *btn) {
+    if (ev->keyval != GDK_KEY_Escape) return FALSE;
+    shell_popup_hide(popup_win);
+    if (GTK_IS_TOGGLE_BUTTON(btn) && gtk_toggle_button_get_active(btn)) gtk_toggle_button_set_active(btn, FALSE);
+    return TRUE;
 }
 
 GtkWidget *shell_create_popup_window(GtkWidget *toggle_btn, gint width, gint height, gboolean resizable) {
@@ -1090,8 +1209,9 @@ GtkWidget *shell_create_popup_window(GtkWidget *toggle_btn, gint width, gint hei
     if (vis) gtk_widget_set_visual(win, vis);
     gtk_widget_set_app_paintable(win, FALSE);
 
-    gtk_widget_add_events(win, GDK_FOCUS_CHANGE_MASK);
+    gtk_widget_add_events(win, GDK_FOCUS_CHANGE_MASK | GDK_KEY_PRESS_MASK);
     g_signal_connect(win, "focus-out-event", G_CALLBACK(on_popup_focus_out), toggle_btn);
+    g_signal_connect_after(win, "key-press-event", G_CALLBACK(on_popup_escape), toggle_btn);
     g_signal_connect_after(win, "map", G_CALLBACK(on_popup_map_animate), toggle_btn);
     g_signal_connect(win, "unmap", G_CALLBACK(on_popup_unmap_forget), NULL);
     g_signal_connect(win, "size-allocate", G_CALLBACK(on_popup_win_size_allocate), toggle_btn);
@@ -1108,12 +1228,13 @@ void shell_toggle_popup_window(GtkToggleButton *btn, GtkWidget *popup_win) {
             g_object_set_data(G_OBJECT(popup_win), "parent-popup", top);
             g_object_set_data(G_OBJECT(top), "child-popup", popup_win);
         }
+        shell_popup_cancel_close(popup_win);
         shell_reposition_popup_window(btn, popup_win);
         gtk_widget_show_all(popup_win);
         shell_reposition_popup_window(btn, popup_win);
         gtk_window_present(GTK_WINDOW(popup_win));
     } else {
-        gtk_widget_hide(popup_win);
+        shell_popup_hide(popup_win);
     }
 }
 
@@ -1348,7 +1469,7 @@ static void apply_titlebar_buttons(UltimateShell *shell) {
     }
 
     titlebar_save_originals(shell, xfwm, xset);
-    gboolean left = (shell->mode == LAYOUT_MACOS && shell->winck_pos == 0);   /* same side as the top-bar buttons */
+    gboolean left = (shell->mode == LAYOUT_MACOS && !shell->gnome_style && shell->winck_pos == 0);   /* same side as the top-bar buttons */
 
     titlebar_set(xfwm, "/general/button_layout", left ? XFWM_LAYOUT_LEFT : XFWM_LAYOUT_RIGHT);
     titlebar_set(xset, "/Gtk/DecorationLayout",  left ? GTK_LAYOUT_LEFT  : GTK_LAYOUT_RIGHT);
@@ -1376,13 +1497,14 @@ void shell_apply_layout(UltimateShell *shell, ShellLayoutMode new_mode) {
     if (!shell) return;
     shell->mode = new_mode;
     gboolean is_mac = (new_mode == LAYOUT_MACOS);
+    gboolean gnome = is_mac && shell->gnome_style;   /* top bar + dock, GNOME arrangement */
 
     sync_xfce_panel_edge_and_size(shell, is_mac);
-    global_menu_set_enabled(is_mac);
+    global_menu_set_enabled(is_mac && !gnome);
     windowck_apply_settings(shell);
 
     if (xfconf_init(NULL)) {
-        apply_appmenu_xsettings(xfconf_channel_get("xsettings"), is_mac);
+        apply_appmenu_xsettings(xfconf_channel_get("xsettings"), is_mac && !gnome);
     }
     apply_titlebar_buttons(shell);
 
@@ -1437,7 +1559,14 @@ void shell_apply_layout(UltimateShell *shell, ShellLayoutMode new_mode) {
     /* ---- Start button + workspace indicator per layout ---- */
     if (shell->center_group)
         gtk_box_set_spacing(GTK_BOX(shell->center_group), CLAMP(shell->tb_icon_spacing, 0, 24));
-    if (is_mac) {
+    if (gnome) {
+        /* [Workspaces  App name]      [Clock]      [▲ Quick Settings] - no start button */
+        shell_place(shell->start_btn, shell->left_box, 0, FALSE, 0);
+        shell_place(shell->mac_top_Controls_box, shell->left_box, 1, FALSE, 0);
+        if (shell->ws_widget) shell_place(shell->ws_widget, shell->left_box, 2, FALSE, 4);
+        if (shell->app_title_widget) shell_place(shell->app_title_widget, shell->left_box, 3, FALSE, 2);
+        if (shell->clock_widget && shell->center_group) shell_place(shell->clock_widget, shell->center_group, 0, FALSE, 0);
+    } else if (is_mac) {
         shell_place(shell->start_btn, shell->left_box, 0, FALSE, 0);              /* Apple menu */
         shell_place(shell->mac_top_Controls_box, shell->left_box, 1, FALSE, 0);
         if (shell->ws_widget) {
@@ -1462,8 +1591,31 @@ void shell_apply_layout(UltimateShell *shell, ShellLayoutMode new_mode) {
         }
     }
 
+    /* outside GNOME mode the clock sits in the right zone, after the tray */
+    if (!gnome && shell->clock_widget && shell->right_box &&
+        gtk_widget_get_parent(shell->clock_widget) != shell->right_box) {
+        gint pos = 1;
+        GList *kids = gtk_container_get_children(GTK_CONTAINER(shell->right_box));
+        gint k = 0;
+        for (GList *l = kids; l; l = l->next, k++) if (l->data == shell->systray_widget) pos = k + 1;
+        g_list_free(kids);
+        GtkWidget *cp = gtk_widget_get_parent(shell->clock_widget);
+        g_object_ref(shell->clock_widget);
+        if (cp) gtk_container_remove(GTK_CONTAINER(cp), shell->clock_widget);
+        gtk_box_pack_start(GTK_BOX(shell->right_box), shell->clock_widget, FALSE, FALSE, 2);
+        gtk_box_reorder_child(GTK_BOX(shell->right_box), shell->clock_widget, pos);
+        g_object_unref(shell->clock_widget);
+    }
+    if (shell->start_btn) {
+        gtk_widget_set_no_show_all(shell->start_btn, gnome);   /* the workspace pill / Show Apps open it instead */
+        if (gnome) gtk_widget_hide(shell->start_btn); else gtk_widget_show(shell->start_btn);
+    }
+    if (shell->app_title_widget) {
+        if (gnome) app_title_refresh(); else gtk_widget_hide(shell->app_title_widget);
+    }
+
     if (shell->mac_top_Controls_box) {
-        if (is_mac) {
+        if (is_mac && !gnome) {
             gtk_widget_show_all(shell->mac_top_Controls_box);
         } else {
             gtk_widget_hide(shell->mac_top_Controls_box);
@@ -1471,7 +1623,7 @@ void shell_apply_layout(UltimateShell *shell, ShellLayoutMode new_mode) {
     }
 
     if (shell->windowck_widget) {
-        if (is_mac && shell->winck_enabled) {
+        if (is_mac && !gnome && shell->winck_enabled) {
             gtk_widget_show(shell->windowck_widget);
             windowck_apply_settings(shell);
         } else {
@@ -1548,12 +1700,23 @@ static void on_compositing_toggled(GtkToggleButton *b, UltimateShell *shell) {
     if (!xfconf_init(NULL)) return;
     xfconf_channel_set_bool(xfconf_channel_get("xfwm4"), "/general/use_compositing", gtk_toggle_button_get_active(b));
 }
-static void on_anim_mode_changed(GtkComboBox *c, UltimateShell *shell) {
-    shell->anim_mode = CLAMP(gtk_combo_box_get_active(c), 0, 2);
+static void anim_controls_sensitive(GtkWidget *any, UltimateShell *shell) {
+    GtkWidget *style_row = g_object_get_data(G_OBJECT(any), "style-row");
+    GtkWidget *speed_row = g_object_get_data(G_OBJECT(any), "speed-row");
+    if (style_row) gtk_widget_set_sensitive(style_row, shell->anim_mode != 0);
+    if (speed_row) gtk_widget_set_sensitive(speed_row, shell->anim_mode != 0);
+}
+static void on_anim_enabled_toggled(GtkToggleButton *b, UltimateShell *shell) {
+    shell->anim_mode = gtk_toggle_button_get_active(b) ? shell->anim_style : 0;
     shell_apply_animation_css(shell);
     save_settings_to_xfconf(shell);
-    GtkWidget *speed_row = g_object_get_data(G_OBJECT(c), "speed-row");
-    if (speed_row) gtk_widget_set_sensitive(speed_row, shell->anim_mode != 0);
+    anim_controls_sensitive(GTK_WIDGET(b), shell);
+}
+static void on_anim_style_changed(GtkComboBox *c, UltimateShell *shell) {
+    shell->anim_style = gtk_combo_box_get_active(c) == 1 ? 2 : 1;
+    if (shell->anim_mode != 0) shell->anim_mode = shell->anim_style;
+    shell_apply_animation_css(shell);
+    save_settings_to_xfconf(shell);
 }
 static gchar *on_anim_speed_format(GtkScale *s, gdouble v, gpointer d) {
     gint p = (gint)v;
@@ -1566,11 +1729,54 @@ static void on_anim_speed_changed(GtkRange *r, UltimateShell *shell) {
     save_settings_to_xfconf(shell);
 }
 
+static gint shell_layout_combo_index(UltimateShell *shell) {
+    if (shell->mode != LAYOUT_MACOS) return 1;
+    return shell->gnome_style ? 2 : 0;
+}
+
+/* ---- Super (Windows) key opens the start menu ----
+   xfce4-keyboard-shortcuts runs our command on Super_L; the command sends the panel a
+   plugin event that lands in on_plugin_remote_event. A Super_L binding that was there
+   before (e.g. Whisker Menu) is kept and put back when the option is turned off. */
+#define SUPER_KEY_PROP "/commands/custom/Super_L"
+#define SUPER_KEY_CMD  "xfce4-panel --plugin-event=ultimateshell:popup:bool:true"
+static gboolean on_plugin_remote_event(XfcePanelPlugin *plugin, const gchar *name, const GValue *value, UltimateShell *shell) {
+    if (g_strcmp0(name, "popup") != 0) return FALSE;
+    start_menu_toggle_from_key(shell);
+    return TRUE;
+}
+static void super_key_apply(UltimateShell *shell) {
+    if (!shell || !shell->channel || !xfconf_init(NULL)) return;
+    XfconfChannel *kb = xfconf_channel_get("xfce4-keyboard-shortcuts");
+    if (!kb) return;
+    gchar *cur = xfconf_channel_get_string(kb, SUPER_KEY_PROP, NULL);
+    gboolean ours = (g_strcmp0(cur, SUPER_KEY_CMD) == 0);
+    if (shell->super_key_start) {
+        if (!ours) {
+            /* remember what was bound before (empty = nothing) */
+            xfconf_channel_set_string(shell->channel, "/plugins/ultimateshell/super_key_orig", cur ? cur : "");
+            xfconf_channel_set_string(kb, SUPER_KEY_PROP, SUPER_KEY_CMD);
+        }
+    } else if (ours) {
+        gchar *orig = xfconf_channel_get_string(shell->channel, "/plugins/ultimateshell/super_key_orig", "");
+        if (orig && orig[0]) xfconf_channel_set_string(kb, SUPER_KEY_PROP, orig);
+        else xfconf_channel_reset_property(kb, SUPER_KEY_PROP, FALSE);
+        g_free(orig);
+    }
+    g_free(cur);
+}
+static void on_super_key_toggled(GtkToggleButton *b, UltimateShell *shell) {
+    shell->super_key_start = gtk_toggle_button_get_active(b);
+    save_settings_to_xfconf(shell);
+    super_key_apply(shell);
+}
+
 static void on_layout_combo_changed(GtkComboBox *combo, UltimateShell *shell) {
     gint active = gtk_combo_box_get_active(combo);
-    ShellLayoutMode target_mode = (active == 0) ? LAYOUT_MACOS : LAYOUT_WINDOWS;
+    ShellLayoutMode target_mode = (active == 1) ? LAYOUT_WINDOWS : LAYOUT_MACOS;   /* GNOME = top bar + dock too */
+    gboolean target_gnome = (active == 2);
 
-    if (target_mode == shell->mode) return;
+    if (active == shell_layout_combo_index(shell)) return;
 
     GtkWidget *toplevel = gtk_widget_get_toplevel(GTK_WIDGET(combo));
     GtkWindow *parent_win = GTK_IS_WINDOW(toplevel) ? GTK_WINDOW(toplevel) : NULL;
@@ -1587,7 +1793,8 @@ static void on_layout_combo_changed(GtkComboBox *combo, UltimateShell *shell) {
         "Switching to %s requires logging out of your session so Global Menu modules, "
         "X11 struts, and panel layouts initialize cleanly. "
         "Please make sure any open documents are saved before continuing.",
-        (target_mode == LAYOUT_MACOS)
+        target_gnome ? "GNOME Top Bar + Bottom Dock Layout"
+        : (target_mode == LAYOUT_MACOS)
             ? "macOS Menu Bar + Bottom Dock Layout"
             : "Windows 11 / 10 / Plasma Taskbar Layout"
     );
@@ -1604,7 +1811,7 @@ static void on_layout_combo_changed(GtkComboBox *combo, UltimateShell *shell) {
 
     if (resp != GTK_RESPONSE_ACCEPT) {
         g_signal_handlers_block_by_func(combo, G_CALLBACK(on_layout_combo_changed), shell);
-        gtk_combo_box_set_active(combo, (shell->mode == LAYOUT_MACOS) ? 0 : 1);
+        gtk_combo_box_set_active(combo, shell_layout_combo_index(shell));
         g_signal_handlers_unblock_by_func(combo, G_CALLBACK(on_layout_combo_changed), shell);
         return;
     }
@@ -1612,6 +1819,7 @@ static void on_layout_combo_changed(GtkComboBox *combo, UltimateShell *shell) {
     /* Silently persist the new mode, panel edge/size, and xsettings to xfconf
        without rearranging live panel widgets before the session closes */
     shell->mode = target_mode;
+    shell->gnome_style = target_gnome;
     save_settings_to_xfconf(shell);
     /* put the panel at the new layout's edge and height now, so it comes back right */
     sync_xfce_panel_edge_and_size(shell, target_mode == LAYOUT_MACOS);
@@ -1619,7 +1827,7 @@ static void on_layout_combo_changed(GtkComboBox *combo, UltimateShell *shell) {
 
     /* Pre-save GTK xsettings for the next login session without moving the live panel */
     XfconfChannel *xset = xfconf_channel_get("xsettings");
-    apply_appmenu_xsettings(xset, target_mode == LAYOUT_MACOS);
+    apply_appmenu_xsettings(xset, target_mode == LAYOUT_MACOS && !target_gnome);
     if (gdk_display_get_default()) {
         gdk_display_sync(gdk_display_get_default());
     }
@@ -1655,6 +1863,7 @@ typedef struct {
     GtkWidget *combo_search_pos;
 
     GtkWidget *chk_show_desc;
+    GtkWidget *chk_win10_tiles;
 
     /* Category sidebar / filter bar group (Whisker & Fullscreen Launchpad) */
     GtkWidget *box_cat_group;
@@ -1679,7 +1888,7 @@ static void sync_start_tab_controls(StartTabUI *ui) {
     ui->syncing = TRUE;
 
     UltimateShell *shell = ui->shell;
-    gint st = CLAMP((gint)shell->start_style, 0, 4);
+    gint st = CLAMP((gint)shell->start_style, 0, START_STYLE_COUNT - 1);
 
     /* Update widget values to match the newly selected style's slot [st] */
     if (GTK_IS_SPIN_BUTTON(ui->spin_list_icon))
@@ -1689,7 +1898,8 @@ static void sync_start_tab_controls(StartTabUI *ui) {
     if (GTK_IS_SPIN_BUTTON(ui->spin_grid_cols))
         gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->spin_grid_cols), shell->start_style_grid_cols[st]);
     if (GTK_IS_SPIN_BUTTON(ui->spin_fs_rows))
-        gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->spin_fs_rows), shell->start_style_fs_rows);
+        gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->spin_fs_rows),
+                                  shell->start_style == START_STYLE_GNOME ? shell->start_gnome_rows : shell->start_style_fs_rows);
     if (GTK_IS_SPIN_BUTTON(ui->spin_label_pt))
         gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->spin_label_pt), shell->start_style_label_pt[st]);
     if (GTK_IS_COMBO_BOX(ui->combo_search_pos))
@@ -1720,22 +1930,23 @@ static void sync_start_tab_controls(StartTabUI *ui) {
      * 3 = START_STYLE_WHISKER    (List + Category Sidebar + Search Pos + Desc)
      * 4 = START_STYLE_FULLSCREEN (Grid + FS Rows + Category Filter Bar)
      */
-    gboolean has_list    = (st == START_STYLE_DEFAULT || st == START_STYLE_WIN7 || st == START_STYLE_WIN11 || st == START_STYLE_WHISKER);
-    gboolean has_grid    = (st == START_STYLE_WIN11   || st == START_STYLE_FULLSCREEN);
-    gboolean has_fs_rows = (st == START_STYLE_FULLSCREEN);
-    gboolean has_search  = (st == START_STYLE_DEFAULT || st == START_STYLE_WIN11 || st == START_STYLE_WHISKER);
+    gboolean has_list    = (st == START_STYLE_DEFAULT || st == START_STYLE_WIN7 || st == START_STYLE_WIN11 || st == START_STYLE_WHISKER || st == START_STYLE_WIN10);
+    gboolean has_grid    = (st == START_STYLE_WIN11   || st == START_STYLE_FULLSCREEN || st == START_STYLE_GNOME || st == START_STYLE_WIN10);
+    gboolean has_fs_rows = (st == START_STYLE_FULLSCREEN || st == START_STYLE_GNOME);
+    gboolean has_search  = (st == START_STYLE_DEFAULT || st == START_STYLE_WIN11 || st == START_STYLE_WHISKER || st == START_STYLE_WIN10);
     gboolean has_desc    = has_list;
     gboolean has_cats    = (st == START_STYLE_WIN7 || st == START_STYLE_WHISKER || st == START_STYLE_FULLSCREEN);
     gboolean has_win7    = (st == START_STYLE_WIN7);
-    gboolean has_footer  = (st != START_STYLE_FULLSCREEN);
+    gboolean has_footer  = (st != START_STYLE_FULLSCREEN && st != START_STYLE_GNOME);
 
     if (ui->row_list_icon)  gtk_widget_set_visible(ui->row_list_icon,  has_list);
-    if (ui->row_grid_icon)  gtk_widget_set_visible(ui->row_grid_icon,  has_grid);
+    if (ui->row_grid_icon)  gtk_widget_set_visible(ui->row_grid_icon,  has_grid && st != START_STYLE_WIN10);
     if (ui->row_grid_cols)  gtk_widget_set_visible(ui->row_grid_cols,  has_grid);
     if (ui->row_fs_rows)    gtk_widget_set_visible(ui->row_fs_rows,    has_fs_rows);
     if (ui->row_label_pt)   gtk_widget_set_visible(ui->row_label_pt,   TRUE);
     if (ui->row_search_pos) gtk_widget_set_visible(ui->row_search_pos, has_search);
     if (ui->chk_show_desc)  gtk_widget_set_visible(ui->chk_show_desc,  has_desc);
+    if (ui->chk_win10_tiles) gtk_widget_set_visible(ui->chk_win10_tiles, st == START_STYLE_WIN10);
     if (ui->box_cat_group)  gtk_widget_set_visible(ui->box_cat_group,  has_cats);
     if (ui->box_win7_group) gtk_widget_set_visible(ui->box_win7_group, has_win7);
     if (ui->box_footer_group) gtk_widget_set_visible(ui->box_footer_group, has_footer);
@@ -1743,8 +1954,24 @@ static void sync_start_tab_controls(StartTabUI *ui) {
     ui->syncing = FALSE;
 }
 
+/* one line under the style list: what the short name means */
+static const gchar *start_style_blurb(gint st) {
+    static const gchar *b[START_STYLE_COUNT] = {
+        "A single scrolling list of apps with search.",
+        "Two columns like Windows 7: apps and categories left, places and power right.",
+        "Centred like Windows 11: pinned apps grid, All apps list and Recommended.",
+        "Like Whisker Menu: categories down the side, their apps next to them.",
+        "Full screen like macOS: pages of app icons with category pills.",
+        "Like Windows 10: A–Z list on the left, resizable pinned tiles on the right.",
+        "Full screen like GNOME: workspace overview on top, pages of apps below.",
+    };
+    return b[CLAMP(st, 0, START_STYLE_COUNT - 1)];
+}
+
 static void on_start_style_changed(GtkComboBox *combo, UltimateShell *shell) {
     shell->start_style = (StartMenuStyle)gtk_combo_box_get_active(combo);
+    GtkWidget *blurb = g_object_get_data(G_OBJECT(combo), "style-blurb");
+    if (GTK_IS_LABEL(blurb)) gtk_label_set_text(GTK_LABEL(blurb), start_style_blurb(shell->start_style));
     if (g_start_tab_ui) sync_start_tab_controls(g_start_tab_ui);
     start_menu_rebuild_style(shell);
     save_settings_to_xfconf(shell);
@@ -1771,7 +1998,7 @@ static void on_start_opacity_spin(GtkSpinButton *spin, UltimateShell *shell) {
 
 static void on_start_list_icon_spin(GtkSpinButton *spin, UltimateShell *shell) {
     if (g_start_tab_ui && g_start_tab_ui->syncing) return;
-    gint st = CLAMP((gint)shell->start_style, 0, 4);
+    gint st = CLAMP((gint)shell->start_style, 0, START_STYLE_COUNT - 1);
     shell->start_style_list_icon[st] = gtk_spin_button_get_value_as_int(spin);
     start_menu_rebuild_style(shell);
     save_settings_to_xfconf(shell);
@@ -1779,7 +2006,7 @@ static void on_start_list_icon_spin(GtkSpinButton *spin, UltimateShell *shell) {
 
 static void on_start_grid_icon_spin(GtkSpinButton *spin, UltimateShell *shell) {
     if (g_start_tab_ui && g_start_tab_ui->syncing) return;
-    gint st = CLAMP((gint)shell->start_style, 0, 4);
+    gint st = CLAMP((gint)shell->start_style, 0, START_STYLE_COUNT - 1);
     shell->start_style_grid_icon[st] = gtk_spin_button_get_value_as_int(spin);
     start_menu_rebuild_style(shell);
     save_settings_to_xfconf(shell);
@@ -1787,7 +2014,7 @@ static void on_start_grid_icon_spin(GtkSpinButton *spin, UltimateShell *shell) {
 
 static void on_start_grid_cols_spin(GtkSpinButton *spin, UltimateShell *shell) {
     if (g_start_tab_ui && g_start_tab_ui->syncing) return;
-    gint st = CLAMP((gint)shell->start_style, 0, 4);
+    gint st = CLAMP((gint)shell->start_style, 0, START_STYLE_COUNT - 1);
     shell->start_style_grid_cols[st] = gtk_spin_button_get_value_as_int(spin);
     start_menu_rebuild_style(shell);
     save_settings_to_xfconf(shell);
@@ -1795,14 +2022,15 @@ static void on_start_grid_cols_spin(GtkSpinButton *spin, UltimateShell *shell) {
 
 static void on_start_fs_rows_spin(GtkSpinButton *spin, UltimateShell *shell) {
     if (g_start_tab_ui && g_start_tab_ui->syncing) return;
-    shell->start_style_fs_rows = gtk_spin_button_get_value_as_int(spin);
+    if (shell->start_style == START_STYLE_GNOME) shell->start_gnome_rows = gtk_spin_button_get_value_as_int(spin);
+    else shell->start_style_fs_rows = gtk_spin_button_get_value_as_int(spin);
     start_menu_rebuild_style(shell);
     save_settings_to_xfconf(shell);
 }
 
 static void on_start_label_pt_spin(GtkSpinButton *spin, UltimateShell *shell) {
     if (g_start_tab_ui && g_start_tab_ui->syncing) return;
-    gint st = CLAMP((gint)shell->start_style, 0, 4);
+    gint st = CLAMP((gint)shell->start_style, 0, START_STYLE_COUNT - 1);
     shell->start_style_label_pt[st] = gtk_spin_button_get_value_as_int(spin);
     start_menu_rebuild_style(shell);
     save_settings_to_xfconf(shell);
@@ -1810,7 +2038,7 @@ static void on_start_label_pt_spin(GtkSpinButton *spin, UltimateShell *shell) {
 
 static void on_start_search_pos_changed(GtkComboBox *combo, UltimateShell *shell) {
     if (g_start_tab_ui && g_start_tab_ui->syncing) return;
-    gint st = CLAMP((gint)shell->start_style, 0, 4);
+    gint st = CLAMP((gint)shell->start_style, 0, START_STYLE_COUNT - 1);
     shell->start_style_search_pos[st] = (StartSearchPosMode)gtk_combo_box_get_active(combo);
     start_menu_rebuild_style(shell);
     save_settings_to_xfconf(shell);
@@ -1818,7 +2046,7 @@ static void on_start_search_pos_changed(GtkComboBox *combo, UltimateShell *shell
 
 static void on_start_show_desc_toggled(GtkToggleButton *btn, UltimateShell *shell) {
     if (g_start_tab_ui && g_start_tab_ui->syncing) return;
-    gint st = CLAMP((gint)shell->start_style, 0, 4);
+    gint st = CLAMP((gint)shell->start_style, 0, START_STYLE_COUNT - 1);
     shell->start_style_show_desc[st] = gtk_toggle_button_get_active(btn);
     start_menu_rebuild_style(shell);
     save_settings_to_xfconf(shell);
@@ -1826,7 +2054,7 @@ static void on_start_show_desc_toggled(GtkToggleButton *btn, UltimateShell *shel
 
 static void on_start_cat_mode_changed(GtkComboBox *combo, UltimateShell *shell) {
     if (g_start_tab_ui && g_start_tab_ui->syncing) return;
-    gint st = CLAMP((gint)shell->start_style, 0, 4);
+    gint st = CLAMP((gint)shell->start_style, 0, START_STYLE_COUNT - 1);
     shell->start_style_cat_mode[st] = (StartCatDisplayMode)gtk_combo_box_get_active(combo);
     start_menu_rebuild_style(shell);
     save_settings_to_xfconf(shell);
@@ -1834,7 +2062,7 @@ static void on_start_cat_mode_changed(GtkComboBox *combo, UltimateShell *shell) 
 
 static void on_start_cat_icon_spin(GtkSpinButton *spin, UltimateShell *shell) {
     if (g_start_tab_ui && g_start_tab_ui->syncing) return;
-    gint st = CLAMP((gint)shell->start_style, 0, 4);
+    gint st = CLAMP((gint)shell->start_style, 0, START_STYLE_COUNT - 1);
     shell->start_style_cat_icon[st] = gtk_spin_button_get_value_as_int(spin);
     start_menu_rebuild_style(shell);
     save_settings_to_xfconf(shell);
@@ -1842,7 +2070,7 @@ static void on_start_cat_icon_spin(GtkSpinButton *spin, UltimateShell *shell) {
 
 static void on_start_cat_pt_spin(GtkSpinButton *spin, UltimateShell *shell) {
     if (g_start_tab_ui && g_start_tab_ui->syncing) return;
-    gint st = CLAMP((gint)shell->start_style, 0, 4);
+    gint st = CLAMP((gint)shell->start_style, 0, START_STYLE_COUNT - 1);
     shell->start_style_cat_pt[st] = gtk_spin_button_get_value_as_int(spin);
     start_menu_rebuild_style(shell);
     save_settings_to_xfconf(shell);
@@ -1850,7 +2078,7 @@ static void on_start_cat_pt_spin(GtkSpinButton *spin, UltimateShell *shell) {
 
 static void on_start_cat_weight_changed(GtkComboBox *combo, UltimateShell *shell) {
     if (g_start_tab_ui && g_start_tab_ui->syncing) return;
-    gint st = CLAMP((gint)shell->start_style, 0, 4);
+    gint st = CLAMP((gint)shell->start_style, 0, START_STYLE_COUNT - 1);
     gint idx = gtk_combo_box_get_active(combo);
     shell->start_style_cat_weight[st] = (idx == 2) ? 700 : ((idx == 1) ? 600 : 400);
     shell_apply_theme(shell);
@@ -1860,7 +2088,7 @@ static void on_start_cat_weight_changed(GtkComboBox *combo, UltimateShell *shell
 
 static void on_start_cat_spacing_spin(GtkSpinButton *spin, UltimateShell *shell) {
     if (g_start_tab_ui && g_start_tab_ui->syncing) return;
-    gint st = CLAMP((gint)shell->start_style, 0, 4);
+    gint st = CLAMP((gint)shell->start_style, 0, START_STYLE_COUNT - 1);
     shell->start_style_cat_spacing[st] = gtk_spin_button_get_value_as_int(spin);
     start_menu_rebuild_style(shell);
     save_settings_to_xfconf(shell);
@@ -1868,7 +2096,7 @@ static void on_start_cat_spacing_spin(GtkSpinButton *spin, UltimateShell *shell)
 
 static void on_start_hover_cat_toggled(GtkToggleButton *btn, UltimateShell *shell) {
     if (g_start_tab_ui && g_start_tab_ui->syncing) return;
-    gint st = CLAMP((gint)shell->start_style, 0, 4);
+    gint st = CLAMP((gint)shell->start_style, 0, START_STYLE_COUNT - 1);
     shell->start_style_hover_cat[st] = gtk_toggle_button_get_active(btn);
     start_menu_rebuild_style(shell);
     save_settings_to_xfconf(shell);
@@ -1951,6 +2179,12 @@ static void on_start_recommended_toggled(GtkToggleButton *btn, UltimateShell *sh
     start_menu_rebuild_style(shell);
     save_settings_to_xfconf(shell);
 }
+static void on_win10_tiles_toggled(GtkToggleButton *b, UltimateShell *shell) {
+    shell->win10_show_tiles = gtk_toggle_button_get_active(b);
+    start_menu_rebuild_style(shell);
+    save_settings_to_xfconf(shell);
+}
+
 static void on_start_whisker_grid_changed(GtkComboBox *c, UltimateShell *shell) {
     shell->start_whisker_grid = (gtk_combo_box_get_active(c) == 1);
     start_menu_rebuild_style(shell);
@@ -2176,8 +2410,43 @@ static void on_winck_pad_spin(GtkSpinButton *spin, UltimateShell *shell) {
     save_settings_to_xfconf(shell);
 }
 
+/* Dock style: the Ubuntu dock fixes position, full height and zoom; their controls are locked */
+static void dock_style_sync_controls(GtkWidget *style_combo, UltimateShell *shell) {
+    gboolean ubu = (shell->dock_style == 1);
+    const gchar *keys[] = { "w-pos", "w-mag", "w-full", "w-fwl", "w-zoom", "w-edge", "w-radius" };
+    for (guint i = 0; i < G_N_ELEMENTS(keys); i++) {
+        GtkWidget *w = g_object_get_data(G_OBJECT(style_combo), keys[i]);
+        if (GTK_IS_WIDGET(w)) gtk_widget_set_sensitive(w, !ubu);
+    }
+    GtkWidget *pos = g_object_get_data(G_OBJECT(style_combo), "w-pos");
+    GtkWidget *mag = g_object_get_data(G_OBJECT(style_combo), "w-mag");
+    GtkWidget *full = g_object_get_data(G_OBJECT(style_combo), "w-full");
+    if (GTK_IS_COMBO_BOX(pos)) gtk_combo_box_set_active(GTK_COMBO_BOX(pos), (gint)shell->dock_pos);
+    if (GTK_IS_TOGGLE_BUTTON(mag)) gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(mag), shell->dock_magnify);
+    if (GTK_IS_TOGGLE_BUTTON(full)) gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(full), shell->dock_full_width);
+}
+static void on_dock_style_changed(GtkComboBox *combo, UltimateShell *shell) {
+    gint st = gtk_combo_box_get_active(combo) == 1 ? 1 : 0;
+    if (st == shell->dock_style) return;
+    shell->dock_style = st;
+    if (st == 1) { shell->dock_pos = DOCK_POS_LEFT; shell->dock_full_width = TRUE; shell->dock_magnify = FALSE; }
+    else         { shell->dock_pos = DOCK_POS_BOTTOM; shell->dock_full_width = FALSE; shell->dock_magnify = TRUE; }
+    dock_style_sync_controls(GTK_WIDGET(combo), shell);   /* their handlers apply + save too */
+    taskbar_update_icon_sizes(shell);                      /* buttons re-laid for the new style */
+    dock_window_apply_settings(shell);
+    shell_apply_theme(shell);
+    save_settings_to_xfconf(shell);
+}
+
 static void on_dock_pos_changed(GtkComboBox *combo, UltimateShell *shell) {
     shell->dock_pos = (DockPositionMode)gtk_combo_box_get_active(combo);
+    if (shell->dock_style == 1 && shell->dock_pos != DOCK_POS_LEFT) {   /* the Ubuntu dock lives on the left */
+        shell->dock_pos = DOCK_POS_LEFT;
+        g_signal_handlers_block_by_func(combo, G_CALLBACK(on_dock_pos_changed), shell);
+        gtk_combo_box_set_active(combo, DOCK_POS_LEFT);
+        g_signal_handlers_unblock_by_func(combo, G_CALLBACK(on_dock_pos_changed), shell);
+    }
+    taskbar_update_icon_sizes(shell);
     dock_window_apply_settings(shell);
     save_settings_to_xfconf(shell);
 }
@@ -2358,6 +2627,14 @@ static void on_tray_hide_new_toggled(GtkToggleButton *btn, UltimateShell *shell)
     save_settings_to_xfconf(shell);
 }
 
+static void on_tray_quick_settings_toggled(GtkToggleButton *b, UltimateShell *shell) {
+    shell->tray_quick_settings = gtk_toggle_button_get_active(b);
+    GtkWidget *bt = g_object_get_data(G_OBJECT(b), "qs-bt");
+    if (bt) gtk_widget_set_sensitive(bt, shell->tray_quick_settings);
+    save_settings_to_xfconf(shell);
+    systray_quick_settings_changed(shell);
+}
+
 static void on_tray_menu_primary_toggled(GtkToggleButton *btn, UltimateShell *shell) {
     shell->tray_menu_is_primary = gtk_toggle_button_get_active(btn);
     systray_apply_settings(shell);
@@ -2461,13 +2738,26 @@ static void on_show_notif_toggled(GtkToggleButton *btn, UltimateShell *shell) {
     save_settings_to_xfconf(shell);
 }
 
+/* Remember the window size once resizing has stopped - only those two values
+   (saving everything on every resize step flooded xfconf: "Operation was cancelled") */
+static guint g_prefs_size_save_id = 0;
+static gboolean prefs_size_save_later(gpointer d) {
+    UltimateShell *shell = d;
+    g_prefs_size_save_id = 0;
+    if (shell && shell->channel) {
+        xfconf_channel_set_int(shell->channel, "/plugins/ultimateshell/prefs_w", shell->prefs_w);
+        xfconf_channel_set_int(shell->channel, "/plugins/ultimateshell/prefs_h", shell->prefs_h);
+    }
+    return G_SOURCE_REMOVE;
+}
+
 static gboolean on_prefs_configure_event(GtkWidget *dlg, GdkEventConfigure *ev, UltimateShell *shell) {
-    if (shell && ev->width >= 360 && ev->height >= 300) {
-        if (shell->prefs_w != ev->width || shell->prefs_h != ev->height) {
-            shell->prefs_w = ev->width;
-            shell->prefs_h = ev->height;
-            save_settings_to_xfconf(shell);
-        }
+    if (shell && ev->width >= 360 && ev->height >= 300 &&
+        (shell->prefs_w != ev->width || shell->prefs_h != ev->height)) {
+        shell->prefs_w = ev->width;
+        shell->prefs_h = ev->height;
+        if (g_prefs_size_save_id) g_source_remove(g_prefs_size_save_id);
+        g_prefs_size_save_id = g_timeout_add(600, prefs_size_save_later, shell);
     }
     return FALSE;
 }
@@ -3133,8 +3423,10 @@ void shell_apply_appearance_css(UltimateShell *shell) {
             "menu.ultimate-themed-menu menuitem, .ultimate-themed-menu menuitem,"
             " menu.ultimate-themed-menu menuitem label, .ultimate-themed-menu menuitem label { color: %s; }"
             "menu.ultimate-themed-menu menuitem:hover, .ultimate-themed-menu menuitem:hover { background-color: %s; }"
-            "menu.ultimate-themed-menu menuitem:hover label, .ultimate-themed-menu menuitem:hover label { color: %s; }"
-            "menu.ultimate-themed-menu menuitem:disabled label, .ultimate-themed-menu menuitem:disabled label { color: alpha(%s, 0.45); }"
+            /* shell menus hover with the subtle @ult_hover tint, so text keeps the normal colour */
+            "menu.ultimate-themed-menu menuitem:hover > label, .ultimate-themed-menu menuitem:hover > label,"
+            " menu.ultimate-themed-menu menuitem:hover > arrow, menu.ultimate-themed-menu menuitem:hover > label > accelerator { color: %s; }"
+            "menu.ultimate-themed-menu menuitem:disabled > label, .ultimate-themed-menu menuitem:disabled > label { color: alpha(%s, 0.45); }"
             "#ultimate-start-btn:hover, #ultimate-clock-btn:hover, .ultimate-module-btn:hover, .taskbar-item-btn:hover"
             " { background-color: @ult_hover; border-color: transparent; }"
             "#ultimate-start-btn:hover label, #ultimate-clock-btn:hover label, .ultimate-module-btn:hover label,"
@@ -3149,7 +3441,7 @@ void shell_apply_appearance_css(UltimateShell *shell) {
             /* xfce4-panel draws its edge line itself, in the window's border-color: make it invisible */
             ".xfce4-panel, .xfce4-panel.background, XfcePanelWindow, window.xfce4-panel, #ultimate-root-box"
             " { border: none; border-color: transparent; box-shadow: none; outline: none; }",
-            FG, ACC, ACC_FG, FG, ACC, ACC_FG, FG, FG);
+            FG, ACC, ACC_FG, FG, ACC, FG, FG, FG);
     }
 
     if (shell->ui_font && shell->ui_font[0]) {
@@ -3243,12 +3535,12 @@ void shell_apply_appearance_css(UltimateShell *shell) {
             "menu menuitem label, .menu menuitem label, menu menuitem accelerator,"
             " menu menuitem arrow, menu menuitem check, menu menuitem radio { color: @theme_fg_color; }"
             "menu menuitem accelerator { color: alpha(@theme_fg_color, 0.55); }"
-            "menu menuitem:hover arrow, menu menuitem:hover accelerator { color: @theme_selected_fg_color; }"
-            "menu menuitem:disabled, menu menuitem:disabled label, menu menuitem:disabled arrow"
+            "menu menuitem:hover > arrow, menu menuitem:hover > label > accelerator { color: @theme_selected_fg_color; }"
+            "menu menuitem:disabled, menu menuitem:disabled > label, menu menuitem:disabled > arrow"
             " { color: alpha(@theme_fg_color, 0.40); }"
             "menu menuitem:hover, popover modelbutton:hover { background-color: @theme_selected_bg_color; color: @theme_selected_fg_color; }"
-            "menu menuitem:hover label { color: @theme_selected_fg_color; }"
-            "menu menuitem:disabled label { color: alpha(@theme_fg_color, 0.45); }"
+            "menu menuitem:hover > label { color: @theme_selected_fg_color; }"
+            "menu menuitem:disabled > label { color: alpha(@theme_fg_color, 0.45); }"
             "tooltip, tooltip.background { background-color: @ult_bg_solid; background-image: none;"
             " color: @theme_fg_color; border: 1px solid @ult_border; box-shadow: none; text-shadow: none; }"
             "tooltip label, tooltip * { color: @theme_fg_color; }");
@@ -3348,6 +3640,14 @@ static void shell_refresh_look(UltimateShell *shell) {
 static void appearance_changed(UltimateShell *shell) {
     shell_refresh_look(shell);
     save_settings_to_xfconf(shell);
+}
+
+static gboolean theme_apply_default_for(UltimateShell *shell, gboolean dark);
+void shell_set_dark_mode(UltimateShell *shell, gboolean dark) {
+    if (!shell) return;
+    if (theme_apply_default_for(shell, dark)) return;   /* a default theme is set for this mode */
+    shell->color_mode = dark ? COLOR_DARK : COLOR_LIGHT;
+    appearance_changed(shell);
 }
 
 /* ---- Colours: mode + palette (with transparency) ---- */
@@ -3888,6 +4188,62 @@ static void on_theme_save_clicked(GtkButton *b, UltimateShell *shell) {
     g_key_file_free(kf); g_free(path); g_free(name);
 }
 
+/* ---- default dark / light theme: the Dark mode toggle switches between them ---- */
+static GKeyFile *theme_load_id(const gchar *id) {
+    if (!id || !id[0]) return NULL;
+    if (g_str_has_prefix(id, "builtin:")) {
+        guint i = (guint)g_ascii_strtoull(id + 8, NULL, 10);
+        return i < G_N_ELEMENTS(BUILTIN_THEMES) ? builtin_theme_keyfile(&BUILTIN_THEMES[i]) : NULL;
+    }
+    GKeyFile *kf = g_key_file_new();
+    if (!g_key_file_load_from_file(kf, id, G_KEY_FILE_NONE, NULL)) { g_key_file_free(kf); return NULL; }
+    return kf;
+}
+static gboolean theme_apply_default_for(UltimateShell *shell, gboolean dark) {
+    if (!shell || !shell->channel) return FALSE;
+    gchar *id = xfconf_channel_get_string(shell->channel,
+        dark ? ULT_PROP_ROOT "/shell_theme_default_dark" : ULT_PROP_ROOT "/shell_theme_default_light", "");
+    GKeyFile *kf = theme_load_id(id);
+    g_free(id);
+    if (!kf) return FALSE;                  /* none set, or the theme was deleted: plain Light / Dark */
+    theme_apply(shell, kf);
+    g_key_file_free(kf);
+    return TRUE;
+}
+static GtkWidget *g_theme_defaults_lbl = NULL;
+static void theme_defaults_update(UltimateShell *shell) {
+    if (!GTK_IS_LABEL(g_theme_defaults_lbl) || !shell->channel) return;
+    gchar *dn = xfconf_channel_get_string(shell->channel, ULT_PROP_ROOT "/shell_theme_default_dark_name", "");
+    gchar *ln = xfconf_channel_get_string(shell->channel, ULT_PROP_ROOT "/shell_theme_default_light_name", "");
+    gchar *t = g_markup_printf_escaped("Dark mode toggle - Dark: <b>%s</b>   Light: <b>%s</b>",
+                                       dn[0] ? dn : "plain Dark colours", ln[0] ? ln : "plain Light colours");
+    gtk_label_set_markup(GTK_LABEL(g_theme_defaults_lbl), t);
+    g_free(t); g_free(dn); g_free(ln);
+}
+static void theme_set_default(GtkButton *b, UltimateShell *shell, gboolean dark) {
+    GtkComboBox *c = g_object_get_data(G_OBJECT(b), "theme-combo");
+    const gchar *id = c ? gtk_combo_box_get_active_id(c) : NULL;
+    if (!id || !shell->channel) return;
+    gchar *name = gtk_combo_box_text_get_active_text(GTK_COMBO_BOX_TEXT(c));
+    xfconf_channel_set_string(shell->channel, dark ? ULT_PROP_ROOT "/shell_theme_default_dark" : ULT_PROP_ROOT "/shell_theme_default_light", id);
+    xfconf_channel_set_string(shell->channel, dark ? ULT_PROP_ROOT "/shell_theme_default_dark_name" : ULT_PROP_ROOT "/shell_theme_default_light_name", name ? name : "");
+    g_free(name);
+    theme_defaults_update(shell);
+}
+static void on_theme_default_dark_clicked(GtkButton *b, UltimateShell *shell) { theme_set_default(b, shell, TRUE); }
+static void on_theme_default_light_clicked(GtkButton *b, UltimateShell *shell) { theme_set_default(b, shell, FALSE); }
+static void on_theme_default_clear_clicked(GtkButton *b, UltimateShell *shell) {
+    if (!shell->channel) return;
+    const gchar *keys[] = { "/shell_theme_default_dark", "/shell_theme_default_light",
+                            "/shell_theme_default_dark_name", "/shell_theme_default_light_name" };
+    for (guint i = 0; i < G_N_ELEMENTS(keys); i++) {
+        gchar *k = g_strconcat(ULT_PROP_ROOT, keys[i], NULL);
+        xfconf_channel_reset_property(shell->channel, k, FALSE);
+        g_free(k);
+    }
+    theme_defaults_update(shell);
+}
+
 static void on_theme_delete_clicked(GtkButton *b, UltimateShell *shell) {
     GtkComboBox *c = g_object_get_data(G_OBJECT(b), "theme-combo");
     const gchar *id = gtk_combo_box_get_active_id(c);
@@ -4062,6 +4418,28 @@ static void build_general_appearance(GtkWidget *vbox, UltimateShell *shell) {
         gtk_box_pack_start(GTK_BOX(row), bt, FALSE, FALSE, 0);
     }
     gtk_box_pack_start(GTK_BOX(vbox), row, FALSE, FALSE, 0);
+    {
+        GtkWidget *row2 = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+        struct { const gchar *label, *tip; GCallback cb; } b2[] = {
+            { "Set as Default Dark Theme", "The Dark mode toggle in Quick Settings switches to the selected theme", G_CALLBACK(on_theme_default_dark_clicked) },
+            { "Set as Default Light Theme", "Turning Dark mode off switches to the selected theme", G_CALLBACK(on_theme_default_light_clicked) },
+            { "Clear Defaults", "The Dark mode toggle only switches the Light / Dark colours", G_CALLBACK(on_theme_default_clear_clicked) },
+        };
+        for (guint i = 0; i < G_N_ELEMENTS(b2); i++) {
+            GtkWidget *bt = gtk_button_new_with_label(b2[i].label);
+            gtk_widget_set_tooltip_text(bt, b2[i].tip);
+            g_object_set_data(G_OBJECT(bt), "theme-combo", combo);
+            g_signal_connect(bt, "clicked", b2[i].cb, shell);
+            gtk_box_pack_start(GTK_BOX(row2), bt, FALSE, FALSE, 0);
+        }
+        gtk_box_pack_start(GTK_BOX(vbox), row2, FALSE, FALSE, 0);
+        g_theme_defaults_lbl = gtk_label_new(NULL);
+        gtk_label_set_xalign(GTK_LABEL(g_theme_defaults_lbl), 0.0);
+        gtk_label_set_ellipsize(GTK_LABEL(g_theme_defaults_lbl), PANGO_ELLIPSIZE_END);
+        g_signal_connect(g_theme_defaults_lbl, "destroy", G_CALLBACK(gtk_widget_destroyed), &g_theme_defaults_lbl);
+        gtk_box_pack_start(GTK_BOX(vbox), g_theme_defaults_lbl, FALSE, FALSE, 0);
+        theme_defaults_update(shell);
+    }
     g_theme_combo = combo;
     g_signal_connect(combo, "destroy", G_CALLBACK(gtk_widget_destroyed), &g_theme_combo);
     g_theme_status = gtk_label_new(NULL);
@@ -4307,6 +4685,48 @@ static const gchar *const RESET_SOUND[]   = { "audio_", NULL };
 static const gchar *const RESET_NOTIF[]   = { "show_notif_icon", "notif_", NULL };
 static const gchar *const RESET_WS[]      = { "ws_", NULL };
 
+/* Let the settings window get narrow: every page only scrolls up/down, so its widest widget used
+   to set the window's minimum width. Long drop-down texts shrink with "…" (the open list still
+   shows them in full), long labels wrap. */
+static void settings_make_shrinkable(GtkWidget *w) {
+    if (GTK_IS_COMBO_BOX(w)) {
+        GList *cells = gtk_cell_layout_get_cells(GTK_CELL_LAYOUT(w));
+        for (GList *l = cells; l; l = l->next)
+            if (GTK_IS_CELL_RENDERER_TEXT(l->data))
+                g_object_set(l->data, "ellipsize", PANGO_ELLIPSIZE_END, "width-chars", 8, NULL);
+        g_list_free(cells);
+        gtk_combo_box_set_popup_fixed_width(GTK_COMBO_BOX(w), FALSE);
+        /* a one-column "grid" makes GTK open the list below the button (above if there is no
+           room) instead of on top of it - same look, same items */
+        if (gtk_combo_box_get_wrap_width(GTK_COMBO_BOX(w)) == 0) gtk_combo_box_set_wrap_width(GTK_COMBO_BOX(w), 1);
+    } else if (GTK_IS_LABEL(w)) {
+        const gchar *t = gtk_label_get_text(GTK_LABEL(w));
+        GtkWidget *p = gtk_widget_get_parent(w);
+        gboolean in_combo = p && (GTK_IS_COMBO_BOX(p) || GTK_IS_COMBO_BOX(gtk_widget_get_parent(p)));
+        if (!in_combo && t && g_utf8_strlen(t, -1) > 28 &&
+            gtk_label_get_ellipsize(GTK_LABEL(w)) == PANGO_ELLIPSIZE_NONE && !gtk_label_get_line_wrap(GTK_LABEL(w))) {
+            gtk_label_set_line_wrap(GTK_LABEL(w), TRUE);
+            gtk_label_set_line_wrap_mode(GTK_LABEL(w), PANGO_WRAP_WORD_CHAR);
+            if (gtk_label_get_max_width_chars(GTK_LABEL(w)) < 0) gtk_label_set_max_width_chars(GTK_LABEL(w), 60);
+            gtk_label_set_width_chars(GTK_LABEL(w), 12);   /* it may wrap down to this */
+        }
+    } else if (GTK_IS_SCALE(w)) {
+        gint rw = -1, rh = -1;
+        gtk_widget_get_size_request(w, &rw, &rh);
+        if (rw > 140) gtk_widget_set_size_request(w, 140, rh);   /* sliders a bit narrower at minimum */
+    }
+    if (GTK_IS_CONTAINER(w) && !GTK_IS_COMBO_BOX(w)) {
+        GList *kids = gtk_container_get_children(GTK_CONTAINER(w));
+        for (GList *l = kids; l; l = l->next) settings_make_shrinkable(l->data);
+        g_list_free(kids);
+    }
+}
+
+static gboolean settings_shrink_later(gpointer stack) {
+    if (GTK_IS_WIDGET(stack)) settings_make_shrinkable(GTK_WIDGET(stack));
+    return G_SOURCE_REMOVE;
+}
+
 static void on_configure_plugin(XfcePanelPlugin *plugin, UltimateShell *shell) {
     if (g_active_prefs_dlg && GTK_IS_WIDGET(g_active_prefs_dlg)) {
         gtk_window_present(GTK_WINDOW(g_active_prefs_dlg));
@@ -4327,7 +4747,7 @@ static void on_configure_plugin(XfcePanelPlugin *plugin, UltimateShell *shell) {
     g_active_prefs_dlg = dlg;
     g_object_add_weak_pointer(G_OBJECT(dlg), (gpointer *)&g_active_prefs_dlg);
 
-    gint init_w = CLAMP(shell->prefs_w, 480, 1400);
+    gint init_w = CLAMP(shell->prefs_w, 460, 1400);
     gint init_h = CLAMP(shell->prefs_h, 440, 1000);
     gtk_window_set_default_size(GTK_WINDOW(dlg), init_w, init_h);
     gtk_window_resize(GTK_WINDOW(dlg), init_w, init_h);
@@ -4425,7 +4845,8 @@ static void on_configure_plugin(XfcePanelPlugin *plugin, UltimateShell *shell) {
     GtkWidget *combo_layout = gtk_combo_box_text_new();
     gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(combo_layout), "macOS Menu Bar + Bottom Dock Layout");
     gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(combo_layout), "Windows 11 / 10 / Plasma Taskbar Layout");
-    gtk_combo_box_set_active(GTK_COMBO_BOX(combo_layout), (shell->mode == LAYOUT_MACOS) ? 0 : 1);
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(combo_layout), "GNOME Top Bar + Bottom Dock Layout");
+    gtk_combo_box_set_active(GTK_COMBO_BOX(combo_layout), shell_layout_combo_index(shell));
     g_signal_connect(combo_layout, "changed", G_CALLBACK(on_layout_combo_changed), shell);
     gtk_box_pack_start(GTK_BOX(vbox_general), combo_layout, FALSE, FALSE, 0);
 
@@ -4490,6 +4911,15 @@ static void on_configure_plugin(XfcePanelPlugin *plugin, UltimateShell *shell) {
     gtk_label_set_markup(GTK_LABEL(lbl_dock), "<b>macOS Dock Customization</b>");
     gtk_widget_set_halign(lbl_dock, GTK_ALIGN_START);
     gtk_box_pack_start(GTK_BOX(vbox_dock), lbl_dock, FALSE, FALSE, 0);
+
+    GtkWidget *dstyle_hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_box_pack_start(GTK_BOX(dstyle_hbox), gtk_label_new("Dock Style:"), FALSE, FALSE, 0);
+    GtkWidget *combo_dstyle = gtk_combo_box_text_new();
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(combo_dstyle), "macOS Dock (floating, magnification)");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(combo_dstyle), "Ubuntu Dock (left edge, full height, no zoom)");
+    gtk_combo_box_set_active(GTK_COMBO_BOX(combo_dstyle), shell->dock_style == 1 ? 1 : 0);
+    gtk_box_pack_end(GTK_BOX(dstyle_hbox), combo_dstyle, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(vbox_dock), dstyle_hbox, FALSE, FALSE, 0);
 
     GtkWidget *dpos_hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     gtk_box_pack_start(GTK_BOX(dpos_hbox), gtk_label_new("Dock Screen Position:"), FALSE, FALSE, 0);
@@ -4578,6 +5008,12 @@ static void on_configure_plugin(XfcePanelPlugin *plugin, UltimateShell *shell) {
     g_signal_connect(combo_fwl, "changed", G_CALLBACK(on_dock_fw_layout_changed), shell);
     gtk_box_pack_end(GTK_BOX(fwl_hbox), combo_fwl, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(vbox_dock), fwl_hbox, FALSE, FALSE, 0);
+    g_object_set_data(G_OBJECT(combo_dstyle), "w-pos", combo_dpos);
+    g_object_set_data(G_OBJECT(combo_dstyle), "w-mag", mag_chk);
+    g_object_set_data(G_OBJECT(combo_dstyle), "w-full", full_chk);
+    g_object_set_data(G_OBJECT(combo_dstyle), "w-fwl", fwl_hbox);
+    dock_style_sync_controls(combo_dstyle, shell);
+    g_signal_connect(combo_dstyle, "changed", G_CALLBACK(on_dock_style_changed), shell);
 
     create_icon_picker_row(vbox_top,
                            "Custom Top-Bar System Menu Icon:",
@@ -4650,15 +5086,34 @@ static void on_configure_plugin(XfcePanelPlugin *plugin, UltimateShell *shell) {
     gtk_widget_set_halign(lbl_sm, GTK_ALIGN_START);
     gtk_box_pack_start(GTK_BOX(vbox_sm), lbl_sm, FALSE, FALSE, 0);
 
+    {
+        GtkWidget *sk = gtk_check_button_new_with_label("Super (Windows) key opens the Start menu");
+        gtk_widget_set_tooltip_text(sk, "Binds Super to the start menu in Keyboard Shortcuts. A previous Super binding is restored when this is off.");
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(sk), shell->super_key_start);
+        g_signal_connect(sk, "toggled", G_CALLBACK(on_super_key_toggled), shell);
+        gtk_box_pack_start(GTK_BOX(vbox_sm), sk, FALSE, FALSE, 0);
+    }
+
     GtkWidget *combo_sm = gtk_combo_box_text_new();
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(combo_sm), "Default List Menu");
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(combo_sm), "Windows 7 Two-Column Menu");
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(combo_sm), "Windows 11 Centered Pinned Grid + Search");
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(combo_sm), "Whisker Category Menu");
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(combo_sm), "macOS Launchpad Fullscreen Grid");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(combo_sm), "List");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(combo_sm), "Classic");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(combo_sm), "Modern");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(combo_sm), "Categories");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(combo_sm), "Launchpad");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(combo_sm), "Tiles");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(combo_sm), "App Grid");
     gtk_combo_box_set_active(GTK_COMBO_BOX(combo_sm), (gint)shell->start_style);
     g_signal_connect(combo_sm, "changed", G_CALLBACK(on_start_style_changed), shell);
     gtk_box_pack_start(GTK_BOX(vbox_sm), combo_sm, FALSE, FALSE, 0);
+    {
+        GtkWidget *blurb = gtk_label_new(start_style_blurb(shell->start_style));
+        gtk_label_set_xalign(GTK_LABEL(blurb), 0.0);
+        gtk_label_set_line_wrap(GTK_LABEL(blurb), TRUE);
+        gtk_label_set_max_width_chars(GTK_LABEL(blurb), 60);
+        gtk_style_context_add_class(gtk_widget_get_style_context(blurb), "dim-label");
+        g_object_set_data(G_OBJECT(combo_sm), "style-blurb", blurb);
+        gtk_box_pack_start(GTK_BOX(vbox_sm), blurb, FALSE, FALSE, 0);
+    }
 
     GtkWidget *sbm_hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     gtk_box_pack_start(GTK_BOX(sbm_hbox), gtk_label_new("Start Button Display (Windows Mode):"), FALSE, FALSE, 0);
@@ -4705,7 +5160,7 @@ static void on_configure_plugin(XfcePanelPlugin *plugin, UltimateShell *shell) {
     gtk_style_context_add_class(gtk_widget_get_style_context(size_note), "dim-label");
     gtk_box_pack_start(GTK_BOX(vbox_sm), size_note, FALSE, FALSE, 0);
 
-    gint cur_st = CLAMP((gint)shell->start_style, 0, 4);
+    gint cur_st = CLAMP((gint)shell->start_style, 0, START_STYLE_COUNT - 1);
 
     sm_ui->row_list_icon = create_tracked_spin_row(
         vbox_sm, "Application List Icon Size (16 – 48 px):", 16, 48, 2,
@@ -4742,6 +5197,12 @@ static void on_configure_plugin(XfcePanelPlugin *plugin, UltimateShell *shell) {
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(sm_ui->chk_show_desc), shell->start_style_show_desc[cur_st]);
     g_signal_connect(sm_ui->chk_show_desc, "toggled", G_CALLBACK(on_start_show_desc_toggled), shell);
     gtk_box_pack_start(GTK_BOX(vbox_sm), sm_ui->chk_show_desc, FALSE, FALSE, 0);
+
+    sm_ui->chk_win10_tiles = gtk_check_button_new_with_label("Show pinned tiles (Windows 10 menu)");
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(sm_ui->chk_win10_tiles), shell->win10_show_tiles);
+    gtk_widget_set_tooltip_text(sm_ui->chk_win10_tiles, "Off: just the A–Z list, a narrow menu like Windows 10 with no tiles pinned.");
+    g_signal_connect(sm_ui->chk_win10_tiles, "toggled", G_CALLBACK(on_win10_tiles_toggled), shell);
+    gtk_box_pack_start(GTK_BOX(vbox_sm), sm_ui->chk_win10_tiles, FALSE, FALSE, 0);
 
     /* Category Sidebar / Filter Bar Group (Only for Whisker & Fullscreen Launchpad) */
     sm_ui->box_cat_group = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
@@ -5077,6 +5538,13 @@ static void on_configure_plugin(XfcePanelPlugin *plugin, UltimateShell *shell) {
     gtk_widget_set_halign(lbl_feat, GTK_ALIGN_START);
     gtk_box_pack_start(GTK_BOX(vbox_tray), lbl_feat, FALSE, FALSE, 0);
 
+    {
+        GtkWidget *qs = gtk_check_button_new_with_label("Quick Settings (Sound, Network, Bluetooth and Power open one panel)");
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(qs), shell->tray_quick_settings);
+        g_signal_connect(qs, "toggled", G_CALLBACK(on_tray_quick_settings_toggled), shell);
+        gtk_box_pack_start(GTK_BOX(vbox_tray), qs, FALSE, FALSE, 0);
+    }
+
     GtkWidget *t_mp = gtk_check_button_new_with_label("Menu is primary action (Left-click opens menu, Right-click hides/moves icon)");
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(t_mp), shell->tray_menu_is_primary);
     g_signal_connect(t_mp, "toggled", G_CALLBACK(on_tray_menu_primary_toggled), shell);
@@ -5184,15 +5652,21 @@ static void on_configure_plugin(XfcePanelPlugin *plugin, UltimateShell *shell) {
         g_signal_connect(comp, "toggled", G_CALLBACK(on_compositing_toggled), shell);
         gtk_box_pack_start(GTK_BOX(vbox_general), comp, FALSE, FALSE, 0);
 
+        GtkWidget *anim_chk = gtk_check_button_new_with_label("Animations");
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(anim_chk), shell->anim_mode != 0);
+        gtk_widget_set_tooltip_text(anim_chk, "Untick for popups and menus that open and close instantly.");
+        gtk_box_pack_start(GTK_BOX(vbox_general), anim_chk, FALSE, FALSE, 0);
+
         GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-        gtk_box_pack_start(GTK_BOX(row), gtk_label_new("Animations:"), FALSE, FALSE, 0);
+        gtk_widget_set_margin_start(row, 24);
+        gtk_box_pack_start(GTK_BOX(row), gtk_label_new("Style:"), FALSE, FALSE, 0);
         GtkWidget *am = gtk_combo_box_text_new();
-        gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(am), "Off");
-        gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(am), "Subtle (fades)");
-        gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(am), "Full (fades + slides)");
-        gtk_combo_box_set_active(GTK_COMBO_BOX(am), CLAMP(shell->anim_mode, 0, 2));
+        gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(am), "Fade (fade in and out)");
+        gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(am), "Slide (slide out of and back into the bar)");
+        gtk_combo_box_set_active(GTK_COMBO_BOX(am), shell->anim_style == 2 ? 1 : 0);
         gtk_box_pack_end(GTK_BOX(row), am, FALSE, FALSE, 0);
         gtk_box_pack_start(GTK_BOX(vbox_general), row, FALSE, FALSE, 0);
+        gtk_widget_set_sensitive(row, shell->anim_mode != 0);
 
         GtkWidget *srow = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
         gtk_box_pack_start(GTK_BOX(srow), gtk_label_new("Animation speed:"), FALSE, FALSE, 0);
@@ -5204,13 +5678,16 @@ static void on_configure_plugin(XfcePanelPlugin *plugin, UltimateShell *shell) {
         g_signal_connect(sp, "value-changed", G_CALLBACK(on_anim_speed_changed), shell);
         gtk_box_pack_end(GTK_BOX(srow), sp, FALSE, FALSE, 0);
         gtk_widget_set_sensitive(srow, shell->anim_mode != 0);
+        gtk_widget_set_margin_start(srow, 24);
         gtk_box_pack_start(GTK_BOX(vbox_general), srow, FALSE, FALSE, 0);
-        g_object_set_data(G_OBJECT(am), "speed-row", srow);
-        g_signal_connect(am, "changed", G_CALLBACK(on_anim_mode_changed), shell);
+        g_object_set_data(G_OBJECT(anim_chk), "style-row", row);
+        g_object_set_data(G_OBJECT(anim_chk), "speed-row", srow);
+        g_signal_connect(anim_chk, "toggled", G_CALLBACK(on_anim_enabled_toggled), shell);
+        g_signal_connect(am, "changed", G_CALLBACK(on_anim_style_changed), shell);
 
         GtkWidget *note = gtk_label_new(NULL);
-        gtk_label_set_markup(GTK_LABEL(note), "<small>Popups fade in only while compositing is on. "
-                                              "Off makes everything instant (good for slow machines and VMs).</small>");
+        gtk_label_set_markup(GTK_LABEL(note), "<small>Popups animate only while compositing is on. "
+                                              "Untick Animations for instant popups (good for slow machines and VMs).</small>");
         gtk_label_set_xalign(GTK_LABEL(note), 0.0);
         gtk_label_set_line_wrap(GTK_LABEL(note), TRUE);
         gtk_style_context_add_class(gtk_widget_get_style_context(note), "dim-label");
@@ -5285,7 +5762,9 @@ static void on_configure_plugin(XfcePanelPlugin *plugin, UltimateShell *shell) {
     settings_add_page(GTK_STACK(stack), vbox_notif,   "notif",   "Notifications",    PAGE_ANY,      shell, RESET_NOTIF);
     settings_add_page(GTK_STACK(stack), vbox_about,   "about",   "About",            PAGE_ANY,      shell, NULL);
 
+    settings_make_shrinkable(stack);                  /* the window can now be made narrow */
     gtk_widget_show_all(dlg);
+    g_timeout_add(250, settings_shrink_later, stack);   /* again for rows that pages add after opening */
     sync_start_tab_controls(sm_ui);
     look_snapshot_reset(shell);                       /* the look as the window opened */
     g_object_set_data_full(G_OBJECT(stack), "prev-page", g_strdup(gtk_stack_get_visible_child_name(GTK_STACK(stack))), g_free);
@@ -5333,6 +5812,13 @@ static void ultimate_shell_construct(XfcePanelPlugin *plugin) {
         NULL);
     xfce_panel_plugin_menu_show_configure(plugin);
 
+    g_signal_connect(plugin, "remote-event", G_CALLBACK(on_plugin_remote_event), shell);
+    super_key_apply(shell);
+
+    /* before any widget is built: the start menu, popups and stacks read their animation
+       times from it while they are created (set later, the first build got no animation) */
+    g_anim_shell = shell;
+
     shell->root_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     gtk_widget_set_name(shell->root_box, "ultimate-root-box");
 
@@ -5361,6 +5847,8 @@ static void ultimate_shell_construct(XfcePanelPlugin *plugin) {
     gtk_box_pack_start(GTK_BOX(shell->mac_top_Controls_box), shell->windowck_widget, FALSE, FALSE, 4);
     gtk_box_pack_start(GTK_BOX(shell->mac_top_Controls_box), shell->global_menu_widget, FALSE, FALSE, 4);
     gtk_box_pack_start(GTK_BOX(shell->left_box), shell->mac_top_Controls_box, FALSE, FALSE, 0);
+    shell->app_title_widget = app_title_new(shell);      /* GNOME mode only */
+    gtk_box_pack_start(GTK_BOX(shell->left_box), shell->app_title_widget, FALSE, FALSE, 0);
 
     /* Centered group (Start + taskbar in the centered Windows layouts) */
     shell->center_group = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);

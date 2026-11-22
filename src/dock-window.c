@@ -24,6 +24,7 @@ static gdouble g_dock_cursor_y = 0.0;
 
 static GtkWidget *g_dock_launchpad_btn = NULL;
 static GtkWidget *g_dock_launchpad_img = NULL;
+GtkWidget *dock_window_launchpad_btn(void) { return g_dock_launchpad_btn; }
 static GtkWidget *g_dock_trash_img = NULL;
 static GtkWidget *g_dock_spacer_left = NULL;
 static GtkWidget *g_dock_spacer_right = NULL;
@@ -31,6 +32,9 @@ static GtkWidget *g_dock_spacer_right = NULL;
 static gint get_plank_buffer_thickness(UltimateShell *shell) {
     gint base_icon = CLAMP(shell->dock_icon_size, 24, 64);
     gint pad_v     = CLAMP(shell->dock_pad_v, 0, 24);
+    /* Ubuntu dock: no zoom and no hops, so the window is just the strip - the drawn icons
+       and the real buttons share it exactly (the zoom room is what pushed them apart) */
+    if (shell->dock_style == 1) return base_icon + (pad_v * 2) + 12;
     gdouble max_z  = 2.0;
     gint max_icon  = (gint)(base_icon * max_z + 0.5);
     return max_icon + (pad_v * 2) + 46;
@@ -273,7 +277,7 @@ static gboolean on_draw_dock_shelf_bg(GtkWidget *widget, cairo_t *cr, UltimateSh
 
     DockRenderItem items[MAX_DOCK_ITEMS];
     memset(items, 0, sizeof(items));
-    for (gint k = 0; k < MAX_DOCK_ITEMS; k++) items[k].le_progress = -1.0;   /* Launchpad / Trash have no progress */
+    for (gint k = 0; k < MAX_DOCK_ITEMS; k++) { items[k].le_progress = -1.0; items[k].press_scale = 1.0; }   /* Launchpad / Trash: no progress, never pressed-in */
     gint total = 0;
 
     if (GTK_IS_WIDGET(g_dock_launchpad_btn) && gtk_widget_get_visible(g_dock_launchpad_btn)) {
@@ -398,7 +402,8 @@ static gboolean on_draw_dock_shelf_bg(GtkWidget *widget, cairo_t *cr, UltimateSh
         sx = alloc_w - sw;
         sy = MAX(0.0, first_edge);
         sh = MIN((gdouble)alloc_h - sy, last_edge - first_edge);
-    } else {
+    }
+    if (vert && shell->dock_full_width) { sy = 0.0; sh = alloc_h; }   /* full height: the whole edge */ else {
         sh = MIN((gdouble)alloc_h, (gdouble)fixed_sh);
         sy = alloc_h - sh;
         if (!shell->dock_full_width) {
@@ -472,11 +477,28 @@ static gboolean on_draw_dock_shelf_bg(GtkWidget *widget, cairo_t *cr, UltimateSh
         GdkPixbuf *pb = items[i].pb_master;
         if (!pb || !GDK_IS_PIXBUF(pb)) continue;
 
-        gdouble draw_sz = base_px * scale[i];
-        gdouble bounce  = items[i].bounce_offset;
+        if (shell->dock_style == 1 && vert) {
+            /* Ubuntu dock: a rounded tile behind the hovered icon, a softer one for the focused app */
+            gboolean hov = items[i].is_hovered || i == hovered_idx;
+            gdouble a = hov ? (items[i].has_active ? 0.22 : 0.14) : (items[i].has_active ? 0.10 : 0.0);
+            if (a > 0.0) {
+                gdouble tile = MIN(sw - 8.0, base_px + 14.0);
+                gdouble tx = sx + (sw - tile) / 2.0;
+                gdouble ty = disp_c[i] - tile / 2.0;
+                draw_shelf_rounded_rect(cr, tx, ty, tile, tile, 8.0);
+                cairo_set_source_rgba(cr, fg_col.red, fg_col.green, fg_col.blue, a);
+                cairo_fill(cr);
+            }
+        }
+        gdouble press   = (shell->dock_style == 1) ? CLAMP(items[i].press_scale, 0.5, 1.0) : 1.0;
+        gdouble draw_sz = base_px * scale[i] * press;            /* Ubuntu dock: shrinks while pressed */
+        gdouble bounce  = items[i].bounce_offset + base_px * scale[i] * (1.0 - press) / 2.0;   /* stays centred */
         gdouble ix = 0.0, iy = 0.0;
 
-        if (shell->dock_pos == DOCK_POS_LEFT) {
+        if (shell->dock_style == 1 && vert) {          /* Ubuntu dock: centred in the strip */
+            ix = sx + (sw - draw_sz) / 2.0;
+            iy = disp_c[i] - draw_sz / 2.0;
+        } else if (shell->dock_pos == DOCK_POS_LEFT) {
             ix = icon_edge_gap + bounce;
             iy = disp_c[i] - draw_sz / 2.0;
         } else if (shell->dock_pos == DOCK_POS_RIGHT) {
@@ -685,9 +707,48 @@ static void sync_dock_button_alignment(UltimateShell *shell) {
         gtk_widget_set_margin_bottom(shell->dock_trash_btn, (shell->dock_pos == DOCK_POS_BOTTOM) ? (pad_v + 4) : side_hr);
     }
     if (GTK_IS_WIDGET(shell->taskbar_box)) {
-        gtk_widget_set_halign(shell->taskbar_box, (fw && fw_mode == 3) ? GTK_ALIGN_START : GTK_ALIGN_CENTER);
+        gtk_widget_set_halign(shell->taskbar_box, taskbar_dock_halign(shell));
         gtk_widget_set_valign(shell->taskbar_box, v_al);
         gtk_widget_set_margin_bottom(shell->taskbar_box, (shell->dock_pos == DOCK_POS_BOTTOM) ? pad_v : 0);
+    }
+
+    gboolean ubuntu = (shell->dock_style == 1 && shell->dock_pos != DOCK_POS_BOTTOM);
+    if (ubuntu && GTK_IS_BOX(shell->dock_inner_box)) {
+        /* Ubuntu dock: [apps + Trash] from the top ... [Show Apps] at the bottom */
+        GtkWidget *ib = shell->dock_inner_box;
+        GtkWidget *order[5] = { shell->taskbar_box, shell->dock_trash_btn, g_dock_spacer_left, g_dock_launchpad_btn, g_dock_spacer_right };
+        gint pos = 0;
+        for (gint k = 0; k < 5; k++) {
+            if (!GTK_IS_WIDGET(order[k]) || gtk_widget_get_parent(order[k]) != ib) continue;
+            gboolean grow = (order[k] == g_dock_spacer_left);
+            guint pad = (order[k] == shell->dock_trash_btn || order[k] == g_dock_launchpad_btn) ? 2 : 0;
+            gtk_box_set_child_packing(GTK_BOX(ib), order[k], grow, grow, pad, GTK_PACK_START);
+            gtk_box_reorder_child(GTK_BOX(ib), order[k], pos++);
+        }
+        if (GTK_IS_WIDGET(shell->taskbar_box)) {
+            gtk_widget_set_valign(shell->taskbar_box, GTK_ALIGN_START);
+            gtk_widget_set_margin_top(shell->taskbar_box, 6);
+        }
+        if (GTK_IS_WIDGET(shell->dock_trash_btn)) {
+            gtk_widget_set_valign(shell->dock_trash_btn, GTK_ALIGN_START);
+            gtk_widget_set_margin_top(shell->dock_trash_btn, 2);
+            gtk_widget_set_margin_bottom(shell->dock_trash_btn, 0);
+        }
+        if (GTK_IS_WIDGET(shell->dock_trash_btn)) gtk_widget_set_halign(shell->dock_trash_btn, GTK_ALIGN_FILL);
+        if (GTK_IS_WIDGET(g_dock_launchpad_btn)) {
+            gtk_widget_set_halign(g_dock_launchpad_btn, GTK_ALIGN_FILL);
+            gtk_widget_set_valign(g_dock_launchpad_btn, GTK_ALIGN_END);
+            gtk_widget_set_margin_top(g_dock_launchpad_btn, 0);
+            gtk_widget_set_margin_bottom(g_dock_launchpad_btn, 8);
+        }
+        return;
+    }
+    if (GTK_IS_WIDGET(shell->taskbar_box)) gtk_widget_set_margin_top(shell->taskbar_box, 0);
+    if (GTK_IS_BOX(shell->dock_inner_box)) {   /* back from the Ubuntu order: Trash packs from the end again */
+        if (GTK_IS_WIDGET(shell->dock_trash_btn) && gtk_widget_get_parent(shell->dock_trash_btn) == shell->dock_inner_box)
+            gtk_box_set_child_packing(GTK_BOX(shell->dock_inner_box), shell->dock_trash_btn, FALSE, FALSE, 2, GTK_PACK_END);
+        if (GTK_IS_WIDGET(g_dock_launchpad_btn) && gtk_widget_get_parent(g_dock_launchpad_btn) == shell->dock_inner_box)
+            gtk_box_set_child_packing(GTK_BOX(shell->dock_inner_box), g_dock_launchpad_btn, FALSE, FALSE, 2, GTK_PACK_START);
     }
 
     if (GTK_IS_BOX(shell->dock_inner_box)) {
@@ -831,13 +892,13 @@ static void update_dock_input_shape(UltimateShell *shell) {
         rect.height = wh;
     } else if (shell->dock_pos == DOCK_POS_LEFT) {
         rect.x = 0;
-        rect.y = MAX(0, side_hr - 12);
+        rect.y = shell->dock_full_width ? 0 : MAX(0, side_hr - 12);
         rect.width = MIN(ww, shelf_t + 6);
         rect.height = MAX(24, wh - 2 * rect.y);
     } else if (shell->dock_pos == DOCK_POS_RIGHT) {
         rect.width = MIN(ww, shelf_t + 6);
         rect.x = MAX(0, ww - rect.width);
-        rect.y = MAX(0, side_hr - 12);
+        rect.y = shell->dock_full_width ? 0 : MAX(0, side_hr - 12);
         rect.height = MAX(24, wh - 2 * rect.y);
     } else {
         rect.height = MIN(wh, shelf_t + 6);
@@ -869,7 +930,13 @@ void dock_window_reposition(UltimateShell *shell) {
     gdk_monitor_get_geometry(monitor, &geom);
 
     gint buf_thick = get_plank_buffer_thickness(shell);
-    gint edge_px   = CLAMP(shell->dock_edge_dist, 0, 64);
+    gint edge_px   = shell->dock_full_width ? 0 : CLAMP(shell->dock_edge_dist, 0, 64);
+    gboolean vert_full = shell->dock_full_width && shell->dock_pos != DOCK_POS_BOTTOM;
+    /* full height (Ubuntu dock): from under the top bar to the bottom of the screen */
+    GdkRectangle wa = geom;
+    gdk_monitor_get_workarea(monitor, &wa);
+    gint full_top = MAX(geom.y, wa.y);
+    gint full_h   = MAX(100, geom.y + geom.height - full_top);
 
     GtkRequisition req;
     gtk_widget_get_preferred_size(shell->dock_window, NULL, &req);
@@ -882,14 +949,16 @@ void dock_window_reposition(UltimateShell *shell) {
         gtk_orientable_set_orientation(GTK_ORIENTABLE(shell->dock_inner_box), GTK_ORIENTATION_VERTICAL);
         gtk_orientable_set_orientation(GTK_ORIENTABLE(shell->taskbar_box), GTK_ORIENTATION_VERTICAL);
         gtk_widget_set_size_request(shell->dock_inner_box, buf_thick, -1);
+        gtk_widget_set_size_request(shell->dock_window, -1, vert_full ? full_h : -1);
         x = geom.x + edge_px;
-        y = geom.y + (geom.height - req.height) / 2;
+        y = vert_full ? full_top : geom.y + (geom.height - req.height) / 2;
     } else if (shell->dock_pos == DOCK_POS_RIGHT) {
         gtk_orientable_set_orientation(GTK_ORIENTABLE(shell->dock_inner_box), GTK_ORIENTATION_VERTICAL);
         gtk_orientable_set_orientation(GTK_ORIENTABLE(shell->taskbar_box), GTK_ORIENTATION_VERTICAL);
         gtk_widget_set_size_request(shell->dock_inner_box, buf_thick, -1);
+        gtk_widget_set_size_request(shell->dock_window, -1, vert_full ? full_h : -1);
         x = geom.x + geom.width - buf_thick - edge_px;
-        y = geom.y + (geom.height - req.height) / 2;
+        y = vert_full ? full_top : geom.y + (geom.height - req.height) / 2;
     } else {
         gtk_orientable_set_orientation(GTK_ORIENTABLE(shell->dock_inner_box), GTK_ORIENTATION_HORIZONTAL);
         gtk_orientable_set_orientation(GTK_ORIENTABLE(shell->taskbar_box), GTK_ORIENTATION_HORIZONTAL);

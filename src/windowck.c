@@ -37,7 +37,7 @@ static WindowckWidget *g_wck_instance = NULL;
 
 static gboolean is_top_bar_mode(UltimateShell *shell) {
     if (!shell) return FALSE;
-    return (shell->mode == LAYOUT_MACOS);
+    return (shell->mode == LAYOUT_MACOS && !shell->gnome_style);   /* GNOME keeps the buttons on the windows */
 }
 
 typedef struct {

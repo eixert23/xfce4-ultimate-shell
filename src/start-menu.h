@@ -7,6 +7,7 @@ GtkWidget *start_menu_button_new(UltimateShell *shell);
 void start_menu_rebuild_style(UltimateShell *shell);
 void start_menu_update_button_appearance(UltimateShell *shell);
 void start_menu_open_from_dock(UltimateShell *shell, GtkWidget *anchor_btn);
+void start_menu_toggle_from_key(UltimateShell *shell);   /* Super key: open / close the start menu */
 
 /* shared app actions (also used by the taskbar / dock right-click menu) */
 void     app_run_as_admin(GAppInfo *app);

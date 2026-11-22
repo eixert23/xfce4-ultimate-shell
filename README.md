@@ -1,20 +1,26 @@
 # Ultimate Shell for XFCE
 
 **xfce4-ultimate-shell** is an XFCE panel plugin that turns the panel into a complete
-desktop shell, in two styles you can switch between at any time:
+desktop shell, in three styles you can switch between at any time:
 
 - **macOS style** — top bar with the Apple-style system menu, a global menu
   (the app's menus in the top bar, with keyboard shortcuts), window buttons and a
   magnifying **dock** with Launchpad.
 - **Windows style** — taskbar with Start menu, live window thumbnails, system tray
   and clock, in several panel layouts (classic, centered Windows 11, …).
+- **GNOME style** — top bar with the workspace pill and the focused app's name, the clock
+  in the centre and Quick Settings on the right, with a macOS or Ubuntu-style dock.
 
-> **Status: beta (0.4.0).** It is used daily and tested on XFCE 4.20 / Debian, but expect
+> **Status: beta (0.4.1).** It is used daily and tested on XFCE 4.20 / Debian, but expect
 > rough edges. X11 only — Wayland is not supported.
 
 | macOS layout | Windows layout |
 |---|---|
 | ![macOS layout: global menu in the top bar and the dock](docs/macos.png) | ![Windows layout: Start menu and taskbar](docs/windows.png) |
+
+| GNOME layout with the Ubuntu dock and the App Grid |
+|---|
+| ![GNOME layout: top bar, Ubuntu dock and App Grid with workspaces](docs/gnome.png) |
 
 <p align="center"><img src="docs/calendar.png" alt="Calendar and notifications flyout" width="70%"></p>
 
@@ -23,8 +29,8 @@ desktop shell, in two styles you can switch between at any time:
 ## Features
 
 **Layouts & panel**
-- macOS and Windows layouts with one switch; four Windows panel layouts (Start + taskbar
-  left or centered, workspaces left/right)
+- macOS, Windows and GNOME layouts with one switch; four Windows panel layouts (Start +
+  taskbar left or centered, workspaces left/right)
 - Workspace indicator (GNOME-style pills, dots or numbers; click, scroll, right-click menu)
 - Animations (Off / Subtle / Full, adjustable speed) and a desktop-compositing switch
 
@@ -36,8 +42,10 @@ desktop shell, in two styles you can switch between at any time:
   indicators, GTK / icon / title-bar themes); built-in macOS and Windows 11 themes
 - Frameless panel with its own soft shadow; panel and dock opacity
 
-**Dock (macOS)**
-- Magnification, auto-hide, positions bottom/left/right, hover name labels
+**Dock (macOS and GNOME)**
+- Two styles: the macOS dock (magnification, positions bottom/left/right, hover name
+  labels) and the Ubuntu dock (left edge, full height, hover tiles, window previews)
+- Auto-hide modes
 - Badges and progress bars sent by apps (e.g. unread mail, Firefox downloads)
 - Drop a file on an icon to open it with that app
 - Launchpad (fullscreen app grid with categories and GNOME-style page dots)
@@ -49,7 +57,9 @@ desktop shell, in two styles you can switch between at any time:
 - Full right-click menus: windows list, app actions (e.g. *New Private Window*),
   run as administrator, edit launcher, minimize/restore all, move to workspace, force quit
 
-**Start menu** — five styles: Default, Windows 7, Windows 11, Whisker (list or icons), Launchpad
+**Start menu** — seven styles: Default, Windows 7, Windows 10 Tiles, Windows 11, Whisker
+(list or icons), Launchpad and GNOME App Grid (with a workspaces overview)
+- The Super (Windows) key opens and closes it
 - Search by name, description, keywords and program; Enter opens the top result
 - Built-in calculator (`12*7` → 84) and "Search the web"
 - "New" badge and *Recently added* for newly installed apps; optional *Recent &
@@ -63,6 +73,9 @@ desktop shell, in two styles you can switch between at any time:
   with every window's title-bar buttons following
 
 **System tray**
+- Quick Settings (Windows 11 style): Sound, Network, Bluetooth and Power in one button and
+  one panel, with toggles (Wi-Fi, Bluetooth, Airplane, Do Not Disturb, Dark mode, Night
+  light, Caffeine), sliders and the player
 - Sound popup: output/input sliders and device choice, now-playing cards with album art,
   seek bar and controls, per-app volume
 - Microphone-in-use indicator, Bluetooth (pairing, audio profiles), removable drives,

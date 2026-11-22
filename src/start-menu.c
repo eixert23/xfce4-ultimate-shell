@@ -2,15 +2,19 @@
 void shell_save_layout_and_theme(UltimateShell *shell);
 #include "start-menu.h"
 #include "taskbar.h"
+#include "dock-window.h"
 #include <gio/gio.h>
 #include <gio/gdesktopappinfo.h>
 #include <cairo.h>
 #include <math.h>
 #include <ctype.h>
 #include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <signal.h>
 #include <unistd.h>
 #include <sys/types.h>
+#include <gdk/gdkx.h>
 
 typedef struct {
     const gchar *title;
@@ -79,6 +83,13 @@ typedef struct {
     guint          rebuild_id, fade_id;
     gdouble        fade_step;
 
+    /* Windows 10 Tiles Menu / GNOME App Grid */
+    GtkWidget     *win10_tiles_grid, *win10_tiles_pane, *win10_list_stack, *win10_list_scroll;
+    GtkWidget     *gnome_overview, *gnome_overview_scroll;
+    GtkWidget     *gnome_peek_prev, *gnome_peek_next;   /* edges of the neighbouring pages */
+    GPtrArray     *fs_page_apps;                         /* per page: GPtrArray of GAppInfo (GNOME) */
+    gint           fs_page_cols;
+
     gboolean       resizing;
     gdouble        drag_start_x;
     gdouble        drag_start_y;
@@ -90,9 +101,27 @@ static StartMenuUI *g_start_ui = NULL;
 
 static gint get_active_style_idx(UltimateShell *shell) {
     if (!shell) return 0;
-    return CLAMP((gint)shell->start_style, 0, 4);
+    return CLAMP((gint)shell->start_style, 0, START_STYLE_COUNT - 1);
 }
 
+/* Launchpad and the GNOME App Grid both fill the screen and page their apps */
+static gboolean sm_style_fullscreen(UltimateShell *shell) {
+    return shell && (shell->start_style == START_STYLE_FULLSCREEN || shell->start_style == START_STYLE_GNOME);
+}
+
+static void win10_fill_tiles(StartMenuUI *ui);
+static void win10_append_resize_menu(GtkWidget *menu, GAppInfo *app);
+static void win10_show_letter_picker(StartMenuUI *ui);
+static void on_start_popup_show(GtkWidget *win, StartMenuUI *ui);
+static void gnome_make_tile_draggable(GtkWidget *eb, GAppInfo *app);
+static void gnome_overview_refresh(StartMenuUI *ui);
+static void gnome_hold_open(StartMenuUI *ui, guint ms);
+static void gnome_update_peeks(StartMenuUI *ui);
+static GtkWidget *gnome_make_peek(StartMenuUI *ui, gint dir);
+static void gnome_ws_resize_start(StartMenuUI *ui, gint sw, gint sh);
+static void gnome_play_intro(StartMenuUI *ui);
+static void on_w10_tile_drag_begin(GtkWidget *w, GdkDragContext *ctx, gpointer d);
+static void on_w10_tile_drag_end(GtkWidget *w, GdkDragContext *ctx, StartMenuUI *ui);
 static const gchar *resolve_app_primary_title(GAppInfo *app, gboolean use_generic) {
     if (use_generic && G_IS_DESKTOP_APP_INFO(app)) {
         const gchar *gen = g_desktop_app_info_get_generic_name(G_DESKTOP_APP_INFO(app));
@@ -196,6 +225,12 @@ static gboolean is_app_in_favorites(UltimateShell *shell, GAppInfo *app) {
 
 static void refresh_win11_pinned(StartMenuUI *ui);
 
+/* List style: show a new pin at once (after the right-click menu is gone) */
+static gboolean start_menu_rebuild_idle_once(gpointer shell) {
+    start_menu_rebuild_style((UltimateShell *)shell);
+    return G_SOURCE_REMOVE;
+}
+
 static void toggle_app_favorite(UltimateShell *shell, GAppInfo *app) {
     if (!shell || !app) return;
     ensure_default_favorites(shell);
@@ -235,7 +270,8 @@ static void toggle_app_favorite(UltimateShell *shell, GAppInfo *app) {
        Win11 refreshes its Pinned grid in place, other styles update the next time they open. */
     StartMenuUI *ui = g_start_ui;
     if (ui && ui->popup_win && gtk_widget_get_visible(ui->popup_win)) {
-        if (shell->start_style == START_STYLE_WIN11) refresh_win11_pinned(ui);
+        if (shell->start_style == START_STYLE_WIN11 || shell->start_style == START_STYLE_WIN10) refresh_win11_pinned(ui);
+        else if (shell->start_style == START_STYLE_DEFAULT) g_idle_add((GSourceFunc)start_menu_rebuild_idle_once, shell);
         else ui->rebuild_pending = TRUE;
     } else {
         start_menu_rebuild_style(shell);
@@ -510,6 +546,53 @@ static gint search_rank(GObject *item, const gchar *q) {
     return 4;
 }
 
+/* ---- favourites order, with a live preview while one is dragged (Modern pinned grid, Categories) ---- */
+static gchar *g_fav_preview = NULL;       /* the order shown during a drag; NULL = the saved one */
+static gchar *g_fav_moving  = NULL;       /* id being dragged */
+static guint  g_fav_restore_id = 0;
+
+static gint fav_index_of(UltimateShell *sh, GAppInfo *app) {
+    if (!sh || !app) return 100000;
+    const gchar *order = g_fav_preview ? g_fav_preview : sh->start_favorites;
+    const gchar *id = g_app_info_get_id(app), *ex = g_app_info_get_executable(app);
+    gchar **toks = g_strsplit(order ? order : "", ";", -1);
+    gint res = 100000, n = 0;
+    for (gint i = 0; toks && toks[i]; i++) {
+        gchar *t = g_strstrip(toks[i]);
+        if (!t[0]) continue;
+        if ((id && g_ascii_strcasecmp(t, id) == 0) || (ex && g_ascii_strcasecmp(t, ex) == 0)) { res = n; break; }
+        n++;
+    }
+    g_strfreev(toks);
+    return res;
+}
+
+/* the saved order with `moving` placed before (or after) `target` */
+static gchar *fav_order_with_move(UltimateShell *sh, const gchar *moving, const gchar *target, gboolean after) {
+    gchar **toks = g_strsplit(sh->start_favorites ? sh->start_favorites : "", ";", -1);
+    GString *out = g_string_new("");
+    gboolean placed = FALSE;
+    for (gint i = 0; toks && toks[i]; i++) {
+        gchar *t = g_strstrip(toks[i]);
+        if (!t[0] || g_ascii_strcasecmp(t, moving) == 0) continue;
+        gboolean here = (g_ascii_strcasecmp(t, target) == 0);
+        if (here && !after) { if (out->len) g_string_append_c(out, ';'); g_string_append(out, moving); placed = TRUE; }
+        if (out->len) g_string_append_c(out, ';');
+        g_string_append(out, t);
+        if (here && after) { g_string_append_c(out, ';'); g_string_append(out, moving); placed = TRUE; }
+    }
+    g_strfreev(toks);
+    if (!placed) { if (out->len) g_string_append_c(out, ';'); g_string_append(out, moving); }
+    return g_string_free(out, FALSE);
+}
+
+static gboolean fav_order_applies(GObject *child, StartMenuUI *ui) {
+    GtkWidget *par = gtk_widget_get_parent(GTK_WIDGET(child));
+    if (!par) return FALSE;
+    if (g_object_get_data(G_OBJECT(par), "fav-order")) return TRUE;
+    return g_object_get_data(G_OBJECT(par), "fav-order-cat") && g_strcmp0(ui->active_category, "Favorites") == 0;
+}
+
 static gint search_sort_common(GObject *a, GObject *b, StartMenuUI *ui) {
     const gchar *q0 = ui->search_entry ? gtk_entry_get_text(GTK_ENTRY(ui->search_entry)) : "";
     if (q0 && q0[0]) {
@@ -517,6 +600,10 @@ static gint search_sort_common(GObject *a, GObject *b, StartMenuUI *ui) {
         gint ra = search_rank(a, q), rb = search_rank(b, q);
         g_free(q);
         if (ra != rb) return ra - rb;
+    } else if (fav_order_applies(a, ui)) {
+        gint fa = fav_index_of(ui->shell, g_object_get_data(a, "app-info"));
+        gint fb = fav_index_of(ui->shell, g_object_get_data(b, "app-info"));
+        if (fa != fb) return fa - fb;
     }
     return GPOINTER_TO_INT(g_object_get_data(a, "order-idx")) - GPOINTER_TO_INT(g_object_get_data(b, "order-idx"));
 }
@@ -542,9 +629,9 @@ static void ensure_search_sort(StartMenuUI *ui, GtkWidget *c) {
 /* first visible, launchable result in the container that is on screen */
 static GtkWidget *first_search_result(StartMenuUI *ui) {
     GtkWidget *cands[2] = { ui->list_box, ui->flow_box };
-    if (ui->shell && (ui->shell->start_style == START_STYLE_FULLSCREEN || ui->shell->start_style == START_STYLE_WIN11)) {
+    if (ui->shell && (sm_style_fullscreen(ui->shell) || ui->shell->start_style == START_STYLE_WIN11)) {
         /* Launchpad searches its grid; Win11 shows the All-apps list while searching */
-        if (ui->shell->start_style == START_STYLE_FULLSCREEN) { cands[0] = ui->flow_box; cands[1] = NULL; }
+        if (sm_style_fullscreen(ui->shell)) { cands[0] = ui->flow_box; cands[1] = NULL; }
     }
     for (gint c = 0; c < 2; c++) {
         GtkWidget *box = cands[c];
@@ -685,8 +772,18 @@ static void on_search_activate(GtkEntry *e, StartMenuUI *ui) {
 }
 
 /* Down / Tab from the search box moves into the results */
+static GtkWidget *fs_current_page_flow(StartMenuUI *ui);
+
 static gboolean on_search_key(GtkWidget *w, GdkEventKey *ev, StartMenuUI *ui) {
     if (ev->keyval != GDK_KEY_Down) return FALSE;
+    const gchar *q = gtk_entry_get_text(GTK_ENTRY(w));
+    if (sm_style_fullscreen(ui->shell) && (!q || !q[0])) {
+        /* full-screen grids: into the page that is showing */
+        GtkWidget *fb = fs_current_page_flow(ui);
+        GtkFlowBoxChild *c = GTK_IS_FLOW_BOX(fb) ? gtk_flow_box_get_child_at_index(GTK_FLOW_BOX(fb), 0) : NULL;
+        if (c) { gtk_widget_grab_focus(GTK_WIDGET(c)); return TRUE; }
+        return FALSE;
+    }
     GtkWidget *r = first_search_result(ui);
     if (!r) return FALSE;
     if (GTK_IS_FLOW_BOX_CHILD(r)) {
@@ -772,6 +869,11 @@ static void favorites_move_before(UltimateShell *sh, const gchar *moving, const 
 
 static void refresh_win11_pinned(StartMenuUI *ui);
 
+static gboolean refresh_pinned_idle(gpointer d) {
+    if (g_start_ui) refresh_win11_pinned(g_start_ui);
+    return G_SOURCE_REMOVE;
+}
+
 static void on_fav_drag_received(GtkWidget *w, GdkDragContext *ctx, gint x, gint y, GtkSelectionData *sd,
                                  guint info, guint t, GAppInfo *target_app) {
     const guchar *data = gtk_selection_data_get_data(sd);
@@ -780,9 +882,129 @@ static void on_fav_drag_received(GtkWidget *w, GdkDragContext *ctx, gint x, gint
         gchar *moving = g_strndup((const gchar *)data, len);
         favorites_move_before(g_start_ui->shell, moving, get_app_id_token(target_app));
         g_free(moving);
-        refresh_win11_pinned(g_start_ui);
+        g_idle_add(refresh_pinned_idle, NULL);   /* not inside the target tile's own handler: it gets rebuilt */
     }
     gtk_drag_finish(ctx, TRUE, FALSE, t);
+}
+
+static gboolean clear_context_menu_guard_idle(gpointer data);
+
+/* A drag takes the pointer and keyboard, so the menu loses focus - which normally closes it.
+   Keep it open for the whole drag (like for the right-click menu), dim the tile being moved. */
+static void on_sm_drag_begin_keep_open(GtkWidget *w, GdkDragContext *ctx, gpointer d) {
+    if (g_start_ui && g_start_ui->popup_win)
+        g_object_set_data(G_OBJECT(g_start_ui->popup_win), "context-menu-open", GINT_TO_POINTER(1));
+    gtk_widget_set_opacity(w, 0.4);
+}
+
+static void on_sm_drag_end_keep_open(GtkWidget *w, GdkDragContext *ctx, gpointer d) {
+    gtk_widget_set_opacity(w, 1.0);
+    if (!g_start_ui || !g_start_ui->popup_win) return;
+    /* a drop on a GNOME workspace holds the grid open a while longer itself */
+    if (g_object_get_data(G_OBJECT(g_start_ui->popup_win), "gnome-hold-id")) return;
+    g_idle_add(clear_context_menu_guard_idle, g_start_ui->popup_win);   /* focus back, guard off */
+}
+
+static void sm_drag_keep_open(GtkWidget *src) {
+    g_signal_connect(src, "drag-begin", G_CALLBACK(on_sm_drag_begin_keep_open), NULL);
+    g_signal_connect(src, "drag-end", G_CALLBACK(on_sm_drag_end_keep_open), NULL);
+}
+
+static void fav_drag_resort(GtkWidget *c) {
+    if (GTK_IS_LIST_BOX(c)) gtk_list_box_invalidate_sort(GTK_LIST_BOX(c));
+    else if (GTK_IS_FLOW_BOX(c)) gtk_flow_box_invalidate_sort(GTK_FLOW_BOX(c));
+}
+
+static void on_fav_src_drag_begin(GtkWidget *w, GdkDragContext *ctx, GAppInfo *app) {
+    g_free(g_fav_moving);
+    g_fav_moving = g_strdup(get_app_id_token(app));
+}
+static void on_fav_src_drag_end(GtkWidget *w, GdkDragContext *ctx, GtkWidget *container) {
+    g_free(g_fav_moving); g_fav_moving = NULL;
+    if (g_fav_preview) { g_free(g_fav_preview); g_fav_preview = NULL; fav_drag_resort(container); }   /* cancelled */
+}
+
+/* the container (pinned grid / Favourites list) is the drop target; its children make room live */
+static gboolean on_fav_area_motion(GtkWidget *c, GdkDragContext *ctx, gint x, gint y, guint t, StartMenuUI *ui) {
+    if (!g_fav_moving) { gdk_drag_status(ctx, 0, t); return FALSE; }
+    if (g_object_get_data(G_OBJECT(c), "fav-order-cat") && g_strcmp0(ui->active_category, "Favorites") != 0) {
+        gdk_drag_status(ctx, 0, t);               /* Categories: reordering only inside Favourites */
+        return TRUE;
+    }
+    if (g_fav_restore_id) { g_source_remove(g_fav_restore_id); g_fav_restore_id = 0; }
+    GtkWidget *target = NULL;
+    gboolean after = FALSE;
+    if (GTK_IS_LIST_BOX(c)) {
+        GtkListBoxRow *r = gtk_list_box_get_row_at_y(GTK_LIST_BOX(c), y);
+        if (r) { GtkAllocation a; gtk_widget_get_allocation(GTK_WIDGET(r), &a); after = (y > a.y + a.height / 2); target = GTK_WIDGET(r); }
+    } else if (GTK_IS_FLOW_BOX(c)) {
+        GtkFlowBoxChild *ch = gtk_flow_box_get_child_at_pos(GTK_FLOW_BOX(c), x, y);
+        if (ch) { GtkAllocation a; gtk_widget_get_allocation(GTK_WIDGET(ch), &a); after = (x > a.x + a.width / 2); target = GTK_WIDGET(ch); }
+    }
+    GAppInfo *tapp = target ? g_object_get_data(G_OBJECT(target), "app-info") : NULL;
+    const gchar *tid = tapp ? get_app_id_token(tapp) : NULL;
+    if (tid && g_ascii_strcasecmp(tid, g_fav_moving) != 0) {
+        gchar *ord = fav_order_with_move(ui->shell, g_fav_moving, tid, after);
+        if (g_strcmp0(ord, g_fav_preview) != 0) { g_free(g_fav_preview); g_fav_preview = ord; fav_drag_resort(c); }
+        else g_free(ord);
+    }
+    gdk_drag_status(ctx, GDK_ACTION_MOVE, t);
+    return TRUE;
+}
+
+static gboolean fav_restore_idle(gpointer c) {
+    g_fav_restore_id = 0;
+    if (g_fav_preview) { g_free(g_fav_preview); g_fav_preview = NULL; fav_drag_resort(c); }
+    return G_SOURCE_REMOVE;
+}
+static void on_fav_area_leave(GtkWidget *c, GdkDragContext *ctx, guint t, StartMenuUI *ui) {
+    if (g_fav_restore_id) g_source_remove(g_fav_restore_id);
+    g_fav_restore_id = g_timeout_add(120, fav_restore_idle, c);    /* GTK sends leave right before a drop too */
+}
+static gboolean on_fav_area_drop(GtkWidget *c, GdkDragContext *ctx, gint x, gint y, guint t, StartMenuUI *ui) {
+    if (g_fav_restore_id) { g_source_remove(g_fav_restore_id); g_fav_restore_id = 0; }
+    if (g_fav_preview) {                          /* what you saw is what is kept */
+        g_free(ui->shell->start_favorites);
+        ui->shell->start_favorites = g_fav_preview;
+        g_fav_preview = NULL;
+        if (ui->shell->channel)
+            xfconf_channel_set_string(ui->shell->channel, "/plugins/ultimateshell/start_favorites", ui->shell->start_favorites);
+        fav_drag_resort(c);
+    }
+    gtk_drag_finish(ctx, TRUE, FALSE, t);
+    return TRUE;
+}
+
+/* make a container's children reorderable as favourites (they must carry "app-info") */
+static void fav_area_setup(StartMenuUI *ui, GtkWidget *c) {
+    gtk_drag_dest_set(c, 0, g_fav_target, 1, GDK_ACTION_MOVE);
+    g_signal_connect(c, "drag-motion", G_CALLBACK(on_fav_area_motion), ui);
+    g_signal_connect(c, "drag-leave", G_CALLBACK(on_fav_area_leave), ui);
+    g_signal_connect(c, "drag-drop", G_CALLBACK(on_fav_area_drop), ui);
+}
+static void fav_source_setup(GtkWidget *src, GAppInfo *app, GtkWidget *container) {
+    if (!GTK_IS_WIDGET(src) || !app) return;
+    gtk_drag_source_set(src, GDK_BUTTON1_MASK, g_fav_target, 1, GDK_ACTION_MOVE);
+    g_object_set_data(G_OBJECT(src), "fav-draggable", GINT_TO_POINTER(1));   /* launch on release, not press */
+    GIcon *gi = g_app_info_get_icon(app);
+    if (gi) gtk_drag_source_set_icon_gicon(src, gi);
+    g_signal_connect(src, "drag-data-get", G_CALLBACK(on_fav_drag_data_get), app);
+    g_signal_connect(src, "drag-begin", G_CALLBACK(on_fav_src_drag_begin), app);
+    g_signal_connect(src, "drag-end", G_CALLBACK(on_fav_src_drag_end), container);
+    sm_drag_keep_open(src);
+}
+
+
+static void on_tile_drag_begin(GtkWidget *w, GdkDragContext *ctx, gpointer d) {
+    /* carry a picture of the tile, not just its icon */
+    GtkAllocation a; gtk_widget_get_allocation(w, &a);
+    cairo_surface_t *sf = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, MAX(1, a.width), MAX(1, a.height));
+    cairo_t *cr = cairo_create(sf);
+    gtk_widget_draw(w, cr);
+    cairo_destroy(cr);
+    cairo_surface_set_device_offset(sf, -a.width / 2.0, -a.height / 2.0);
+    gtk_drag_set_icon_surface(ctx, sf);
+    cairo_surface_destroy(sf);
 }
 
 static void make_tile_reorderable(GtkWidget *eb, GAppInfo *app) {
@@ -792,6 +1014,7 @@ static void make_tile_reorderable(GtkWidget *eb, GAppInfo *app) {
     if (gi) gtk_drag_source_set_icon_gicon(eb, gi);
     g_signal_connect(eb, "drag-data-get", G_CALLBACK(on_fav_drag_data_get), app);
     g_signal_connect(eb, "drag-data-received", G_CALLBACK(on_fav_drag_received), app);
+    sm_drag_keep_open(eb);
 }
 
 static gboolean app_matches_category_filter(UltimateShell *shell, GAppInfo *app, const gchar *filter) {
@@ -944,34 +1167,11 @@ static void spawn_command_with_live_parent(const gchar *cmd_line) {
     g_strfreev(argv);
 }
 
-static gboolean sm_fade_tick(gpointer d) {
-    StartMenuUI *ui = d;
-    gdouble o = gtk_widget_get_opacity(ui->popup_win) - ui->fade_step;
-    if (o <= 0.02 || !gtk_widget_get_visible(ui->popup_win)) {
-        ui->fade_id = 0;
-        gtk_widget_hide(ui->popup_win);
-        gtk_widget_set_opacity(ui->popup_win, 1.0);
-        if (GTK_IS_TOGGLE_BUTTON(ui->btn)) gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ui->btn), FALSE);
-        return G_SOURCE_REMOVE;
-    }
-    gtk_widget_set_opacity(ui->popup_win, o);
-    return G_SOURCE_CONTINUE;
-}
-
-/* Close the menu: a short fade-out when animations are on */
+/* Close the menu with the chosen exit animation (instant when animations are off) */
 static void start_menu_close(StartMenuUI *ui) {
     if (!ui || !ui->popup_win) return;
+    shell_popup_hide(ui->popup_win);   /* before forgetting the dock anchor: Slide uses it */
     g_object_set_data(G_OBJECT(ui->popup_win), "dock-anchor-btn", NULL);
-    gint ms = shell_anim_ms(120);
-    GdkScreen *scr = gdk_screen_get_default();
-    if (ms > 0 && gtk_widget_get_visible(ui->popup_win) && scr && gdk_screen_is_composited(scr)) {
-        if (!ui->fade_id) {
-            ui->fade_step = 15.0 / ms;
-            ui->fade_id = g_timeout_add(15, sm_fade_tick, ui);
-        }
-        return;
-    }
-    gtk_widget_hide(ui->popup_win);
     if (GTK_IS_TOGGLE_BUTTON(ui->btn)) gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ui->btn), FALSE);
 }
 
@@ -1064,6 +1264,14 @@ static void on_app_context_menu_deactivate(GtkMenuShell *ms, GtkWidget *popup_wi
 static gboolean on_app_widget_right_click(GtkWidget *widget, GdkEventButton *event, GAppInfo *app);
 
 static gboolean on_grid_tile_button_press(GtkWidget *widget, GdkEventButton *event, GAppInfo *app) {
+    if (event->type == GDK_BUTTON_PRESS && event->button == 1 && app && g_start_ui && g_start_ui->shell &&
+        (g_start_ui->shell->start_style == START_STYLE_GNOME || g_object_get_data(G_OBJECT(widget), "fav-draggable"))) {
+        /* GNOME App Grid: click = flow-box activation on release, so apps can be dragged.
+           Mark this press so the grid background (same event, bubbling up) doesn't close the grid. */
+        if (g_start_ui->popup_win)
+            g_object_set_data(G_OBJECT(g_start_ui->popup_win), "tile-press-time", GUINT_TO_POINTER(event->time));
+        return FALSE;
+    }
     if (event->type == GDK_BUTTON_PRESS && event->button == 1 && app && g_start_ui) {
         if (g_start_ui->popup_win) {
             gtk_widget_hide(g_start_ui->popup_win);
@@ -1181,10 +1389,14 @@ static gboolean on_app_widget_right_click(GtkWidget *widget, GdkEventButton *eve
         }
 
         gboolean in_fav = is_app_in_favorites(g_start_ui->shell, app);
+        gboolean list_style = (g_start_ui->shell->start_style == START_STYLE_DEFAULT);
         GtkWidget *fav_item = gtk_menu_item_new_with_label(
-            in_fav ? "❌ Remove from Favorites" : "⭐ Add to Favorites");
+            list_style ? (in_fav ? "📌 Unpin from top" : "📌 Pin to top")
+                       : (in_fav ? "❌ Remove from Favorites" : "⭐ Add to Favorites"));
         g_signal_connect(fav_item, "activate", G_CALLBACK(on_fav_menu_item_activated), app);
         gtk_menu_shell_append(GTK_MENU_SHELL(menu), fav_item);
+
+        win10_append_resize_menu(menu, app);
 
         GtkWidget *pin_item = gtk_menu_item_new_with_label("📌 Pin to Taskbar / Dock");
         g_signal_connect(pin_item, "activate", G_CALLBACK(on_pin_menu_item_activated), app);
@@ -1237,6 +1449,10 @@ static void on_app_row_activated(GtkListBox *box, GtkListBoxRow *row, gpointer u
         if (ui->win7_toggle_btn) gtk_button_set_label(GTK_BUTTON(ui->win7_toggle_btn), "◂ Back to Categories");
         return;
     }
+    if (g_object_get_data(G_OBJECT(row), "is-alpha-header")) {
+        if (ui->shell && ui->shell->start_style == START_STYLE_WIN10) win10_show_letter_picker(ui);
+        return;
+    }
     GAppInfo *app = g_object_get_data(G_OBJECT(row), "app-info");
     if (app) launch_app_and_close(ui, app);
 }
@@ -1258,10 +1474,11 @@ static gboolean match_app_item(GObject *item, StartMenuUI *ui) {
                (!ui->active_category || g_strcmp0(ui->active_category, "All") == 0);
     }
 
+    if (g_object_get_data(item, "is-pinned-row") && query && query[0]) return FALSE;   /* it is in A–Z too */
     const gchar *search_key = g_object_get_data(item, "search-key");
     GAppInfo *app = g_object_get_data(item, "app-info");
 
-    if (ui->shell->start_style != START_STYLE_FULLSCREEN) {
+    if (!sm_style_fullscreen(ui->shell)) {
         if ((!query || query[0] == '\0') && ui->active_category && g_strcmp0(ui->active_category, "All") != 0) {
             if (!app || !app_matches_category_filter(ui->shell, app, ui->active_category)) return FALSE;
         }
@@ -1317,6 +1534,44 @@ static void fs_sync_active_category_pill(StartMenuUI *ui) {
     }
 }
 
+static GtkWidget *find_flow_box(GtkWidget *w) {
+    if (GTK_IS_FLOW_BOX(w)) return w;
+    if (!GTK_IS_CONTAINER(w)) return NULL;
+    GtkWidget *hit = NULL;
+    GList *kids = gtk_container_get_children(GTK_CONTAINER(w));
+    for (GList *l = kids; l && !hit; l = l->next) hit = find_flow_box(l->data);
+    g_list_free(kids);
+    return hit;
+}
+static GtkWidget *fs_current_page_flow(StartMenuUI *ui) {
+    if (!ui->fs_page_stack) return NULL;
+    return find_flow_box(gtk_stack_get_visible_child(GTK_STACK(ui->fs_page_stack)));
+}
+
+static void fs_go_to_page(StartMenuUI *ui, gint target_page);
+
+/* arrow keys past the page edge: next / previous page, same row */
+static gboolean on_fs_page_keynav_failed(GtkWidget *fb, GtkDirectionType dir, StartMenuUI *ui) {
+    if (dir != GTK_DIR_LEFT && dir != GTK_DIR_RIGHT) {
+        if (dir == GTK_DIR_UP && ui->search_entry) { gtk_widget_grab_focus(ui->search_entry); return TRUE; }
+        return FALSE;
+    }
+    gint cols = MAX(1, ui->fs_page_cols);
+    GtkWidget *foc = ui->popup_win ? gtk_window_get_focus(GTK_WINDOW(ui->popup_win)) : NULL;
+    gint idx = GTK_IS_FLOW_BOX_CHILD(foc) ? gtk_flow_box_child_get_index(GTK_FLOW_BOX_CHILD(foc)) : 0;
+    gint row = idx / cols;
+    gint target = ui->fs_current_page + (dir == GTK_DIR_RIGHT ? 1 : -1);
+    if (target < 0 || target >= ui->fs_total_pages) return TRUE;
+    fs_go_to_page(ui, target);
+    GtkWidget *nfb = fs_current_page_flow(ui);
+    if (!GTK_IS_FLOW_BOX(nfb)) return TRUE;
+    gint want = row * cols + (dir == GTK_DIR_RIGHT ? 0 : cols - 1);
+    GtkFlowBoxChild *c = gtk_flow_box_get_child_at_index(GTK_FLOW_BOX(nfb), want);
+    while (!c && want > 0) c = gtk_flow_box_get_child_at_index(GTK_FLOW_BOX(nfb), --want);
+    if (c) gtk_widget_grab_focus(GTK_WIDGET(c));
+    return TRUE;
+}
+
 static void fs_go_to_page(StartMenuUI *ui, gint target_page) {
     if (!ui->fs_page_stack || ui->fs_total_pages <= 0) return;
     gint clamped = CLAMP(target_page, 0, ui->fs_total_pages - 1);
@@ -1333,17 +1588,18 @@ static void fs_go_to_page(StartMenuUI *ui, gint target_page) {
 
     fs_sync_active_category_pill(ui);
     if (ui->fs_dots_da) gtk_widget_queue_draw(ui->fs_dots_da);
+    if (ui->gnome_peek_prev) gnome_update_peeks(ui);
 }
 
 static gboolean on_fs_deck_scroll(GtkWidget *widget, GdkEventScroll *event, StartMenuUI *ui) {
-    if (!ui || !ui->shell || ui->shell->start_style != START_STYLE_FULLSCREEN || ui->fs_total_pages <= 1) return FALSE;
+    if (!ui || !ui->shell || !sm_style_fullscreen(ui->shell) || ui->fs_total_pages <= 1) return FALSE;
 
     if (ui->fs_mode_stack && g_strcmp0(gtk_stack_get_visible_child_name(GTK_STACK(ui->fs_mode_stack)), "search") == 0) {
         return FALSE;
     }
 
     if (event->time > 0 && ui->fs_last_scroll_time > 0 &&
-        (event->time - ui->fs_last_scroll_time) < 120) {
+        (event->time - ui->fs_last_scroll_time) < 150u) {                 /* one page per wheel notch (GNOME's scroll timeout) */
         return TRUE;
     }
 
@@ -1368,24 +1624,53 @@ static gboolean on_fs_deck_scroll(GtkWidget *widget, GdkEventScroll *event, Star
     return FALSE;
 }
 
+static void start_popup_close(StartMenuUI *ui) {
+    if (ui->popup_win) {
+        shell_popup_hide(ui->popup_win);   /* before forgetting the dock anchor: Slide uses it */
+        g_object_set_data(G_OBJECT(ui->popup_win), "dock-anchor-btn", NULL);
+    }
+    if (GTK_IS_TOGGLE_BUTTON(ui->btn) && gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(ui->btn)))
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ui->btn), FALSE);
+}
+
+/* While the menu is open it holds the keyboard, so the Super shortcut never reaches
+   Keyboard Shortcuts: the menu closes itself when Super is tapped alone (pressed and
+   released with no other key - Super+E and the like still work as before). */
+static gboolean on_start_popup_key_release(GtkWidget *win, GdkEventKey *event, StartMenuUI *ui) {
+    if (!ui || !ui->popup_win) return FALSE;
+    gboolean super = (event->keyval == GDK_KEY_Super_L || event->keyval == GDK_KEY_Super_R);
+    if (super && g_object_get_data(G_OBJECT(ui->popup_win), "super-armed")) {
+        g_object_set_data(G_OBJECT(ui->popup_win), "super-armed", NULL);
+        if (ui->shell && ui->shell->super_key_start) { start_popup_close(ui); return TRUE; }
+    }
+    return FALSE;
+}
+
 static gboolean on_start_popup_key_press(GtkWidget *win, GdkEventKey *event, StartMenuUI *ui) {
     if (!ui || !ui->shell) return FALSE;
+    if (ui->popup_win)   /* armed by a lone Super press, cleared by any other key */
+        g_object_set_data(G_OBJECT(ui->popup_win), "super-armed",
+                          (event->keyval == GDK_KEY_Super_L || event->keyval == GDK_KEY_Super_R) ? GINT_TO_POINTER(1) : NULL);
 
+    if (event->keyval == GDK_KEY_Escape && ui->search_entry &&
+        gtk_entry_get_text(GTK_ENTRY(ui->search_entry))[0] != '\0') {
+        gtk_entry_set_text(GTK_ENTRY(ui->search_entry), "");      /* Esc: clear the search first */
+        gtk_widget_grab_focus(ui->search_entry);
+        return TRUE;
+    }
     if (event->keyval == GDK_KEY_Escape) {
-        if (ui->popup_win) {
-            g_object_set_data(G_OBJECT(ui->popup_win), "dock-anchor-btn", NULL);
-            gtk_widget_hide(ui->popup_win);
-        }
-        if (GTK_IS_TOGGLE_BUTTON(ui->btn) && gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(ui->btn))) {
-            gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ui->btn), FALSE);
-        }
+        start_popup_close(ui);
         return TRUE;
     }
 
-    if (ui->shell->start_style == START_STYLE_FULLSCREEN) {
+    if (sm_style_fullscreen(ui->shell)) {
         const gchar *q = ui->search_entry ? gtk_entry_get_text(GTK_ENTRY(ui->search_entry)) : "";
         gboolean search_empty = (!q || q[0] == '\0');
 
+        GtkWidget *foc = ui->popup_win ? gtk_window_get_focus(GTK_WINDOW(ui->popup_win)) : NULL;
+        if (GTK_IS_FLOW_BOX_CHILD(foc)) search_empty = FALSE;   /* arrows move between apps then */
+        if ((event->state & GDK_CONTROL_MASK) && event->keyval == GDK_KEY_Page_Down) { fs_go_to_page(ui, ui->fs_current_page + 1); return TRUE; }
+        if ((event->state & GDK_CONTROL_MASK) && event->keyval == GDK_KEY_Page_Up)   { fs_go_to_page(ui, ui->fs_current_page - 1); return TRUE; }
         if (event->keyval == GDK_KEY_Page_Down || (search_empty && event->keyval == GDK_KEY_Right)) {
             fs_go_to_page(ui, ui->fs_current_page + 1);
             return TRUE;
@@ -1418,8 +1703,10 @@ static gboolean on_start_popup_key_press(GtkWidget *win, GdkEventKey *event, Sta
 
 static gboolean on_fs_background_button_press(GtkWidget *eb, GdkEventButton *event, StartMenuUI *ui) {
     if (event->type == GDK_BUTTON_PRESS && event->button == 1 &&
-        ui && ui->shell && ui->shell->start_style == START_STYLE_FULLSCREEN) {
-        if (ui->popup_win) gtk_widget_hide(ui->popup_win);
+        ui && ui->shell && sm_style_fullscreen(ui->shell)) {
+        if (ui->popup_win && GPOINTER_TO_UINT(g_object_get_data(G_OBJECT(ui->popup_win), "tile-press-time")) == event->time)
+            return FALSE;                      /* that press was on an app tile, not on empty space */
+        if (ui->popup_win) shell_popup_hide(ui->popup_win);
         gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ui->btn), FALSE);
         return TRUE;
     }
@@ -1583,8 +1870,8 @@ static gboolean on_press_fs_dots(GtkWidget *widget, GdkEventButton *event, Start
 static void on_search_entry_stop_search(GtkSearchEntry *entry, StartMenuUI *ui) {
     if (!ui) return;
     if (ui->popup_win) {
+        shell_popup_hide(ui->popup_win);   /* before forgetting the dock anchor: Slide uses it */
         g_object_set_data(G_OBJECT(ui->popup_win), "dock-anchor-btn", NULL);
-        gtk_widget_hide(ui->popup_win);
     }
     if (GTK_IS_TOGGLE_BUTTON(ui->btn) && gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(ui->btn))) {
         gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ui->btn), FALSE);
@@ -1595,11 +1882,14 @@ static void on_search_changed(GtkSearchEntry *entry, StartMenuUI *ui) {
     const gchar *q = gtk_entry_get_text(GTK_ENTRY(entry));
     update_search_extras(ui);
     if (ui->rec_widget) gtk_widget_set_visible(ui->rec_widget, !(q && q[0]));
+    if (ui->win10_tiles_pane) gtk_widget_set_visible(ui->win10_tiles_pane, !(q && q[0]));
+    if (ui->win10_list_stack && q && q[0]) gtk_stack_set_visible_child_name(GTK_STACK(ui->win10_list_stack), "list");
+    if (ui->gnome_overview_scroll) gtk_widget_set_visible(ui->gnome_overview_scroll, !(q && q[0]));
     /* rank results: names starting with the text first, then words, then keywords */
     if (q && q[0]) { ensure_search_sort(ui, ui->list_box); ensure_search_sort(ui, ui->flow_box); }
     if (ui->list_box && g_object_get_data(G_OBJECT(ui->list_box), "search-sort-on")) gtk_list_box_invalidate_sort(GTK_LIST_BOX(ui->list_box));
     if (ui->flow_box && g_object_get_data(G_OBJECT(ui->flow_box), "search-sort-on")) gtk_flow_box_invalidate_sort(GTK_FLOW_BOX(ui->flow_box));
-    if (ui->shell && ui->shell->start_style == START_STYLE_FULLSCREEN && ui->fs_mode_stack) {
+    if (ui->shell && sm_style_fullscreen(ui->shell) && ui->fs_mode_stack) {
         if (q && q[0] != '\0') {
             gtk_stack_set_visible_child_name(GTK_STACK(ui->fs_mode_stack), "search");
             if (ui->flow_box) gtk_flow_box_invalidate_filter(GTK_FLOW_BOX(ui->flow_box));
@@ -1630,7 +1920,7 @@ static void on_search_changed(GtkSearchEntry *entry, StartMenuUI *ui) {
 }
 
 static void apply_category_filter_from_btn(GtkWidget *btn, StartMenuUI *ui) {
-    if (ui->shell && ui->shell->start_style == START_STYLE_FULLSCREEN) {
+    if (ui->shell && sm_style_fullscreen(ui->shell)) {
         gint target_page = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(btn), "fs-first-page"));
         if (ui->search_entry && gtk_entry_get_text(GTK_ENTRY(ui->search_entry))[0] != '\0') {
             gtk_entry_set_text(GTK_ENTRY(ui->search_entry), "");
@@ -1646,6 +1936,8 @@ static void apply_category_filter_from_btn(GtkWidget *btn, StartMenuUI *ui) {
     ui->active_category = g_strdup(next_cat);
     if (ui->rec_widget) gtk_widget_set_visible(ui->rec_widget, g_strcmp0(next_cat, "All") == 0);
     if (ui->list_box) gtk_list_box_invalidate_filter(GTK_LIST_BOX(ui->list_box));
+    if (ui->list_box) gtk_list_box_invalidate_sort(GTK_LIST_BOX(ui->list_box));   /* Favourites: your order */
+    if (ui->flow_box) gtk_flow_box_invalidate_sort(GTK_FLOW_BOX(ui->flow_box));
     if (ui->flow_box) gtk_flow_box_invalidate_filter(GTK_FLOW_BOX(ui->flow_box));
 }
 
@@ -2008,7 +2300,20 @@ static GtkWidget *create_list_row_for_app(StartMenuUI *ui, GAppInfo *app, gint l
     return row;
 }
 
+static gboolean on_list_keynav_failed(GtkWidget *lb, GtkDirectionType dir, StartMenuUI *ui) {
+    if (dir == GTK_DIR_UP && ui && ui->search_entry) {
+        gtk_widget_grab_focus(ui->search_entry);
+        gtk_editable_set_position(GTK_EDITABLE(ui->search_entry), -1);
+        return TRUE;
+    }
+    return FALSE;
+}
+
 static void populate_app_list(StartMenuUI *ui, GtkWidget *target_listbox, gboolean with_alpha_headers) {
+    if (!g_object_get_data(G_OBJECT(target_listbox), "keynav-hooked")) {
+        g_signal_connect(target_listbox, "keynav-failed", G_CALLBACK(on_list_keynav_failed), ui);
+        g_object_set_data(G_OBJECT(target_listbox), "keynav-hooked", GINT_TO_POINTER(1));
+    }
     GList *apps = get_sorted_apps_cached(ui);
     gunichar current_letter = 0;
 
@@ -2019,8 +2324,53 @@ static void populate_app_list(StartMenuUI *ui, GtkWidget *target_listbox, gboole
     gboolean show_desc = ui->shell ? ui->shell->start_style_show_desc[st] : FALSE;
     gboolean use_gen   = ui->shell ? ui->shell->start_generic_names : FALSE;
 
+    /* List style: the pinned apps first, in your order (right-click ▸ Pin to top) */
+    if (ui->shell && ui->shell->start_style == START_STYLE_DEFAULT) {
+        ensure_default_favorites(ui->shell);
+        gboolean any = FALSE;
+        gchar **toks = g_strsplit(ui->shell->start_favorites ? ui->shell->start_favorites : "", ";", -1);
+        for (gint t = 0; toks && toks[t]; t++) {
+            gchar *tok = g_strstrip(toks[t]);
+            if (!tok[0]) continue;
+            for (GList *l = apps; l; l = l->next) {
+                GAppInfo *app = G_APP_INFO(l->data);
+                const gchar *id = g_app_info_get_id(app), *ex = g_app_info_get_executable(app);
+                if (!((id && g_ascii_strcasecmp(id, tok) == 0) || (ex && g_ascii_strcasecmp(ex, tok) == 0))) continue;
+                if (!g_app_info_should_show(app)) break;
+                if (!any) {
+                    GtkWidget *hr = gtk_list_box_row_new();
+                    gtk_list_box_row_set_activatable(GTK_LIST_BOX_ROW(hr), FALSE);
+                    gtk_list_box_row_set_selectable(GTK_LIST_BOX_ROW(hr), FALSE);
+                    GtkWidget *hl = gtk_label_new(NULL);
+                    gtk_label_set_markup(GTK_LABEL(hl), "<b>Pinned</b>");
+                    gtk_label_set_xalign(GTK_LABEL(hl), 0.0);
+                    gtk_widget_set_margin_start(hl, 10); gtk_widget_set_margin_top(hl, 4); gtk_widget_set_margin_bottom(hl, 2);
+                    gtk_style_context_add_class(gtk_widget_get_style_context(hl), "start-alpha-header");
+                    gtk_container_add(GTK_CONTAINER(hr), hl);
+                    g_object_set_data(G_OBJECT(hr), "is-alpha-header", GINT_TO_POINTER(1));   /* hidden while searching */
+                    gtk_container_add(GTK_CONTAINER(target_listbox), hr);
+                    any = TRUE;
+                }
+                gint lpt = (ui->shell->start_style_label_pt[st] > 0) ? CLAMP(ui->shell->start_style_label_pt[st], 8, 20) : 11;
+                GtkWidget *pr = create_list_row_for_app(ui, app, list_icon_px, hover_px, lpt, show_desc, use_gen);
+                g_object_set_data(G_OBJECT(pr), "is-pinned-row", GINT_TO_POINTER(1));
+                gtk_container_add(GTK_CONTAINER(target_listbox), pr);
+                break;
+            }
+        }
+        g_strfreev(toks);
+        if (any) {
+            GtkWidget *sep = gtk_list_box_row_new();
+            gtk_list_box_row_set_activatable(GTK_LIST_BOX_ROW(sep), FALSE);
+            gtk_list_box_row_set_selectable(GTK_LIST_BOX_ROW(sep), FALSE);
+            gtk_container_add(GTK_CONTAINER(sep), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL));
+            g_object_set_data(G_OBJECT(sep), "is-alpha-header", GINT_TO_POINTER(1));
+            gtk_container_add(GTK_CONTAINER(target_listbox), sep);
+        }
+    }
+
     /* Recent & Recommended on top of the list (list styles; Win11 / Launchpad place their own) */
-    if (ui->shell && ui->shell->start_style != START_STYLE_WIN11 && ui->shell->start_style != START_STYLE_FULLSCREEN) {
+    if (ui->shell && ui->shell->start_style != START_STYLE_WIN11 && !sm_style_fullscreen(ui->shell)) {
         GtkWidget *rec = build_recommended_section(ui, 1);
         if (rec) {
             GtkWidget *rrow = gtk_list_box_row_new();
@@ -2063,6 +2413,7 @@ static void populate_app_list(StartMenuUI *ui, GtkWidget *target_listbox, gboole
                 g_free(h_mk);
 
                 g_object_set_data(G_OBJECT(hdr_row), "is-alpha-header", GINT_TO_POINTER(1));
+                g_object_set_data_full(G_OBJECT(hdr_row), "alpha-letter", g_strdup(ubuf), g_free);
                 gtk_container_add(GTK_CONTAINER(hdr_row), hdr_lbl);
                 gtk_container_add(GTK_CONTAINER(target_listbox), hdr_row);
             }
@@ -2181,7 +2532,7 @@ static void populate_win11_grid(StartMenuUI *ui, GtkWidget *target_flowbox, gboo
     GList *apps = get_sorted_apps_cached(ui);
 
     gint st = get_active_style_idx(ui->shell);
-    gint max_icon = (st == START_STYLE_FULLSCREEN) ? 96 : 64;
+    gint max_icon = (st == START_STYLE_FULLSCREEN || st == START_STYLE_GNOME) ? 96 : 64;
     gint grid_icon_px = (ui->shell && ui->shell->start_style_grid_icon[st] > 0)
                         ? CLAMP(ui->shell->start_style_grid_icon[st], 24, max_icon) : 36;
     gboolean use_gen  = ui->shell ? ui->shell->start_generic_names : FALSE;
@@ -2203,7 +2554,7 @@ static void populate_win11_grid(StartMenuUI *ui, GtkWidget *target_flowbox, gboo
                 if (!g_app_info_should_show(app)) break;
                 GtkWidget *child = create_grid_tile_for_app(ui, app, grid_icon_px, label_pt, cell_w, cell_h);
                 GtkWidget *eb = gtk_bin_get_child(GTK_BIN(child));
-                if (eb) make_tile_reorderable(eb, app);
+                if (eb) fav_source_setup(eb, app, target_flowbox);   /* drag with a live preview */
                 gtk_container_add(GTK_CONTAINER(target_flowbox), child);
                 break;
             }
@@ -2225,6 +2576,7 @@ static void populate_win11_grid(StartMenuUI *ui, GtkWidget *target_flowbox, gboo
 }
 
 static void refresh_win11_pinned(StartMenuUI *ui) {
+    if (ui && ui->shell && ui->shell->start_style == START_STYLE_WIN10) { win10_fill_tiles(ui); return; }
     if (!ui || !ui->shell || ui->shell->start_style != START_STYLE_WIN11) return;
     GtkWidget *fb = g_object_get_data(G_OBJECT(ui->popup_win), "win11-pinned-flow");
     if (!GTK_IS_FLOW_BOX(fb)) return;
@@ -2234,6 +2586,7 @@ static void refresh_win11_pinned(StartMenuUI *ui) {
     g_object_set_data(G_OBJECT(fb), "search-sort-on", NULL);
     gtk_flow_box_set_sort_func(GTK_FLOW_BOX(fb), NULL, NULL, NULL);
     populate_win11_grid(ui, fb, TRUE);
+    ensure_search_sort(ui, fb);                    /* favourites order (+ search ranking) */
     gtk_widget_show_all(fb);
 }
 
@@ -2246,6 +2599,8 @@ static void get_default_size_for_style(StartMenuStyle style, gint *out_w, gint *
             *out_w = 540; *out_h = 520; break;
         case START_STYLE_WHISKER:
             *out_w = 540; *out_h = 500; break;
+        case START_STYLE_WIN10:
+            *out_w = 760; *out_h = 600; break;
         case START_STYLE_DEFAULT:
         default:
             *out_w = 350; *out_h = 470; break;
@@ -2349,7 +2704,7 @@ static gboolean on_resize_motion(GtkWidget *widget, GdkEventMotion *event, Start
     new_w = CLAMP(new_w, 320, max_w);
     new_h = CLAMP(new_h, 360, max_h);
 
-    gint st = CLAMP((gint)ui->shell->start_style, 0, 4);
+    gint st = CLAMP((gint)ui->shell->start_style, 0, START_STYLE_COUNT - 1);
     ui->shell->start_style_w[st] = new_w;
     ui->shell->start_style_h[st] = new_h;
     ui->shell->start_menu_w = new_w;
@@ -2560,7 +2915,7 @@ static void compute_fullscreen_menu_workarea(StartMenuUI *ui, GdkRectangle *out_
         ui->shell->dock_autohide == DOCK_HIDE_NEVER) {
         gint base_icon = CLAMP(ui->shell->dock_icon_size, 24, 64);
         gint pad_v     = CLAMP(ui->shell->dock_pad_v, 0, 24);
-        gint edge_px   = (ui->shell->dock_full_width && ui->shell->dock_pos == DOCK_POS_BOTTOM)
+        gint edge_px   = ui->shell->dock_full_width   /* full width / full height (Ubuntu): flush with the edge */
                        ? 0 : CLAMP(ui->shell->dock_edge_dist, 0, 64);
         gint d_reserve = base_icon + (pad_v * 2) + 12 + edge_px;
         if (ui->shell->dock_pos == DOCK_POS_BOTTOM) {
@@ -2585,17 +2940,19 @@ static void compute_fullscreen_menu_workarea(StartMenuUI *ui, GdkRectangle *out_
     }
 }
 
-static void build_fullscreen_paged_deck(StartMenuUI *ui, GtkWidget *cat_box, const GdkRectangle *fs_rect) {
+static void build_fullscreen_paged_deck(StartMenuUI *ui, GtkWidget *cat_box, const GdkRectangle *fs_rect,
+                                        gboolean all_only, gint reserve_h) {
     UltimateShell *shell = ui->shell;
-    const gint st = START_STYLE_FULLSCREEN;
+    const gint st = all_only ? START_STYLE_GNOME : START_STYLE_FULLSCREEN;
     gint cat_icon_px  = (shell->start_style_cat_icon[st] > 0) ? CLAMP(shell->start_style_cat_icon[st], 16, 32) : 18;
     gint grid_icon_px = (shell->start_style_grid_icon[st] > 0) ? CLAMP(shell->start_style_grid_icon[st], 32, 96) : 52;
     gint label_pt     = (shell->start_style_label_pt[st] > 0) ? CLAMP(shell->start_style_label_pt[st], 8, 20) : 11;
     gint fs_cols      = (shell->start_style_grid_cols[st] > 0) ? CLAMP(shell->start_style_grid_cols[st], 4, 10) : 7;
-    gint fs_rows      = (shell->start_style_fs_rows > 0) ? CLAMP(shell->start_style_fs_rows, 2, 6) : 4;
+    gint rows_set     = all_only ? shell->start_gnome_rows : shell->start_style_fs_rows;
+    gint fs_rows      = (rows_set > 0) ? CLAMP(rows_set, 2, 6) : (all_only ? 3 : 4);
     StartCatDisplayMode cat_mode = shell->start_style_cat_mode[st];
 
-    gint avail_grid_h = MAX(220, fs_rect->height - 190);
+    gint avail_grid_h = MAX(220, fs_rect->height - 190 - reserve_h);
     gint max_row_h    = (avail_grid_h / fs_rows) - 12;
     gint ideal_cell_h = MAX(76, grid_icon_px + 34 + label_pt * 2);
     gint cell_h       = CLAMP(MIN(ideal_cell_h, max_row_h), 68, 165);
@@ -2625,9 +2982,13 @@ static void build_fullscreen_paged_deck(StartMenuUI *ui, GtkWidget *cat_box, con
     ui->fs_page_cat_idx   = g_array_new(FALSE, FALSE, sizeof(gint));
     ui->fs_total_pages    = 0;
     ui->fs_current_page   = 0;
+    if (ui->fs_page_apps) g_ptr_array_unref(ui->fs_page_apps);
+    ui->fs_page_apps = g_ptr_array_new_with_free_func((GDestroyNotify)g_ptr_array_unref);
+    ui->fs_page_cols = fs_cols;
 
     for (guint c = 0; c < G_N_ELEMENTS(g_category_specs); c++) {
         const CategorySpec *spec = &g_category_specs[c];
+        if (all_only && g_strcmp0(spec->filter, "All") != 0) continue;   /* GNOME: one A–Z run of pages */
         GList *cat_apps = NULL;
 
         for (GList *l = valid_apps; l != NULL; l = l->next) {
@@ -2696,11 +3057,15 @@ static void build_fullscreen_paged_deck(StartMenuUI *ui, GtkWidget *cat_box, con
             gtk_widget_add_events(page_flow, GDK_SCROLL_MASK | GDK_SMOOTH_SCROLL_MASK);
             g_signal_connect(page_flow, "scroll-event", G_CALLBACK(on_fs_deck_scroll), ui);
             g_signal_connect(page_flow, "child-activated", G_CALLBACK(on_flow_child_activated), ui);
+            g_signal_connect(page_flow, "keynav-failed", G_CALLBACK(on_fs_page_keynav_failed), ui);
 
             gint count_on_page = 0;
+            GPtrArray *page_apps = g_ptr_array_new();
             while (iter != NULL && count_on_page < items_per_page) {
                 GAppInfo *app = G_APP_INFO(iter->data);
                 GtkWidget *tile = create_grid_tile_for_app(ui, app, grid_icon_px, label_pt, cell_w, cell_h);
+                if (all_only) gnome_make_tile_draggable(gtk_bin_get_child(GTK_BIN(tile)), app);
+                g_ptr_array_add(page_apps, app);
                 gtk_container_add(GTK_CONTAINER(page_flow), tile);
                 count_on_page++;
                 iter = iter->next;
@@ -2713,6 +3078,7 @@ static void build_fullscreen_paged_deck(StartMenuUI *ui, GtkWidget *cat_box, con
             gtk_stack_add_named(GTK_STACK(ui->fs_page_stack), page_clip, pname);
             g_free(pname);
 
+            g_ptr_array_add(ui->fs_page_apps, page_apps);
             g_array_append_val(ui->fs_page_cat_idx, active_cat_idx);
             ui->fs_total_pages++;
         }
@@ -2721,6 +3087,1245 @@ static void build_fullscreen_paged_deck(StartMenuUI *ui, GtkWidget *cat_box, con
     }
 
     g_list_free(valid_apps);
+}
+
+/* =========================================================================
+ * Windows 10 Tiles Menu: rail · A–Z list · resizable pinned tiles
+ * ========================================================================= */
+#define W10_CELL 48            /* one small tile */
+#define W10_GAP  4
+#define W10_MAX_COLS 12        /* small-tile columns at most (6 medium tiles) */
+/* tile-area width in small-tile columns: the Start ▸ Grid Columns setting counts medium tiles (default 4) */
+static gint win10_cols(UltimateShell *sh) {
+    gint m = (sh && sh->start_style_grid_cols[START_STYLE_WIN10] > 0) ? sh->start_style_grid_cols[START_STYLE_WIN10] : 4;
+    return CLAMP(m, 2, 6) * 2;
+}
+
+/* tile size of a pinned app: 's' small 1×1, 'm' medium 2×2 (default), 'w' wide 4×2 */
+static gchar win10_tile_size(UltimateShell *sh, const gchar *id) {
+    if (!sh || !id || !sh->win10_tile_sizes) return 'm';
+    gchar **toks = g_strsplit(sh->win10_tile_sizes, ";", -1);
+    gchar res = 'm';
+    for (gint i = 0; toks && toks[i]; i++) {
+        gchar *eq = strrchr(toks[i], '=');
+        if (!eq || eq == toks[i]) continue;
+        *eq = '\0';
+        if (g_ascii_strcasecmp(toks[i], id) == 0 && (eq[1] == 's' || eq[1] == 'm' || eq[1] == 'w')) { res = eq[1]; break; }
+    }
+    g_strfreev(toks);
+    return res;
+}
+
+static void win10_set_tile_size(UltimateShell *sh, const gchar *id, gchar size) {
+    if (!sh || !id) return;
+    GString *out = g_string_new("");
+    gchar **toks = g_strsplit(sh->win10_tile_sizes ? sh->win10_tile_sizes : "", ";", -1);
+    for (gint i = 0; toks && toks[i]; i++) {
+        gchar *eq = strrchr(toks[i], '=');
+        if (!eq || eq == toks[i]) continue;
+        gchar *key = g_strndup(toks[i], eq - toks[i]);
+        if (g_ascii_strcasecmp(key, id) != 0) {
+            if (out->len) g_string_append_c(out, ';');
+            g_string_append(out, toks[i]);
+        }
+        g_free(key);
+    }
+    g_strfreev(toks);
+    if (size != 'm') {                         /* medium is the default: not stored */
+        if (out->len) g_string_append_c(out, ';');
+        g_string_append_printf(out, "%s=%c", id, size);
+    }
+    g_free(sh->win10_tile_sizes);
+    sh->win10_tile_sizes = g_string_free(out, FALSE);
+    if (sh->channel) xfconf_channel_set_string(sh->channel, "/plugins/ultimateshell/win10_tile_sizes", sh->win10_tile_sizes);
+}
+
+static gboolean on_win10_tile_press(GtkWidget *w, GdkEventButton *ev, GAppInfo *app) {
+    if (ev->type == GDK_BUTTON_PRESS && ev->button == 3) return on_app_widget_right_click(w, ev, app);
+    return FALSE;
+}
+static gboolean on_win10_tile_release(GtkWidget *w, GdkEventButton *ev, GAppInfo *app) {
+    if (ev->button == 1 && g_start_ui && app) {
+        GtkAllocation a; gtk_widget_get_allocation(w, &a);
+        if (ev->x >= 0 && ev->y >= 0 && ev->x < a.width && ev->y < a.height) launch_app_and_close(g_start_ui, app);
+    }
+    return FALSE;
+}
+
+/* an event box gets no :hover by itself: set it on enter / leave so the tile CSS hover applies */
+static gboolean on_win10_tile_crossing(GtkWidget *w, GdkEventCrossing *ev, gpointer d) {
+    if (ev->detail == GDK_NOTIFY_INFERIOR) return FALSE;
+    gboolean in = (ev->type == GDK_ENTER_NOTIFY);
+    if (in) gtk_widget_set_state_flags(w, GTK_STATE_FLAG_PRELIGHT, FALSE);
+    else gtk_widget_unset_state_flags(w, GTK_STATE_FLAG_PRELIGHT);
+    /* icon zoom, same as the other menus (Start ▸ hover effect setting) */
+    if (g_start_ui && g_start_ui->shell && !g_start_ui->shell->start_hover_effect) in = FALSE;
+    GtkWidget *img = g_object_get_data(G_OBJECT(w), "icon-img");
+    GdkPixbuf *pb = g_object_get_data(G_OBJECT(w), in ? "pb-hover" : "pb-norm");
+    if (GTK_IS_IMAGE(img) && pb) gtk_image_set_from_pixbuf(GTK_IMAGE(img), pb);
+    return FALSE;
+}
+
+static GtkWidget *win10_make_tile(StartMenuUI *ui, GAppInfo *app, gchar size) {
+    gint cw = (size == 's') ? 1 : (size == 'w') ? 4 : 2;
+    gint ch = (size == 's') ? 1 : 2;
+    gint pw = cw * W10_CELL + (cw - 1) * W10_GAP, ph = ch * W10_CELL + (ch - 1) * W10_GAP;
+    gint icon_px = (size == 's') ? 28 : 40;
+
+    GtkWidget *eb = gtk_event_box_new();
+    gtk_widget_set_size_request(eb, pw, ph);
+    gtk_widget_add_events(eb, GDK_BUTTON_PRESS_MASK | GDK_BUTTON_RELEASE_MASK | GDK_ENTER_NOTIFY_MASK | GDK_LEAVE_NOTIFY_MASK);
+    gtk_style_context_add_class(gtk_widget_get_style_context(eb), "win10-tile");
+    g_signal_connect(eb, "enter-notify-event", G_CALLBACK(on_win10_tile_crossing), NULL);
+    g_signal_connect(eb, "leave-notify-event", G_CALLBACK(on_win10_tile_crossing), NULL);
+    gtk_widget_set_tooltip_text(eb, g_app_info_get_display_name(app));
+
+    GtkWidget *ov = gtk_overlay_new();
+    gint zoom_px = icon_px + MAX(4, icon_px * 20 / 100);
+    GdkPixbuf *pb = load_app_pixbuf_at_size(app, icon_px);
+    GdkPixbuf *pbz = load_app_pixbuf_at_size(app, zoom_px);
+    GtkWidget *img = pb ? gtk_image_new_from_pixbuf(pb) : gtk_image_new_from_icon_name("application-x-executable", GTK_ICON_SIZE_DND);
+    gtk_widget_set_size_request(img, zoom_px, zoom_px);       /* room for the zoom: nothing shifts */
+    g_object_set_data(G_OBJECT(eb), "icon-img", img);
+    if (pb)  g_object_set_data_full(G_OBJECT(eb), "pb-norm", pb, g_object_unref);
+    if (pbz) g_object_set_data_full(G_OBJECT(eb), "pb-hover", pbz, g_object_unref);
+    gtk_widget_set_halign(img, GTK_ALIGN_CENTER);
+    gtk_widget_set_valign(img, GTK_ALIGN_CENTER);
+    if (size != 's') gtk_widget_set_margin_bottom(img, 12);
+    gtk_container_add(GTK_CONTAINER(ov), img);
+    if (size != 's') {
+        GtkWidget *lbl = gtk_label_new(resolve_app_primary_title(app, ui->shell && ui->shell->start_generic_names));
+        gtk_label_set_ellipsize(GTK_LABEL(lbl), PANGO_ELLIPSIZE_END);
+        gtk_label_set_xalign(GTK_LABEL(lbl), 0.0);
+        gtk_label_set_max_width_chars(GTK_LABEL(lbl), 1);
+        gtk_widget_set_halign(lbl, GTK_ALIGN_FILL);
+        gtk_widget_set_valign(lbl, GTK_ALIGN_END);
+        gtk_widget_set_margin_start(lbl, 6); gtk_widget_set_margin_end(lbl, 6); gtk_widget_set_margin_bottom(lbl, 4);
+        gtk_style_context_add_class(gtk_widget_get_style_context(lbl), "win10-tile-label");
+        gtk_overlay_add_overlay(GTK_OVERLAY(ov), lbl);
+    }
+    gtk_container_add(GTK_CONTAINER(eb), ov);
+    g_signal_connect(eb, "button-press-event", G_CALLBACK(on_win10_tile_press), app);
+    g_signal_connect(eb, "button-release-event", G_CALLBACK(on_win10_tile_release), app);
+    make_tile_reorderable(eb, app);
+    gtk_drag_dest_unset(eb);                        /* the whole tile area is the drop target (live preview) */
+    g_signal_connect_after(eb, "drag-begin", G_CALLBACK(on_tile_drag_begin), NULL);
+    g_signal_connect(eb, "drag-begin", G_CALLBACK(on_w10_tile_drag_begin), NULL);
+    g_signal_connect(eb, "drag-end", G_CALLBACK(on_w10_tile_drag_end), ui);
+    return eb;
+}
+
+/* Pack the pinned apps into the tile grid in the user's order, first free spot wins */
+/* ---- tile layout: every tile has its own cell (like Windows 10); tiles in the way move down ---- */
+typedef struct { gint c, r, cw, ch; } W10Cell;
+#define W10_MAXR 200
+
+static void w10_size_cells(gchar size, gint *cw, gint *ch) {
+    *cw = (size == 's') ? 1 : (size == 'w') ? 4 : 2;
+    *ch = (size == 's') ? 1 : 2;
+}
+
+static gboolean w10_saved_pos3(UltimateShell *sh, const gchar *id, gint *c, gint *r, gint *g) {
+    *g = 0;
+    if (!sh || !id || !sh->win10_tile_pos) return FALSE;
+    gboolean ok = FALSE;
+    gchar **toks = g_strsplit(sh->win10_tile_pos, ";", -1);
+    for (gint i = 0; toks && toks[i] && !ok; i++) {
+        gchar *eq = strrchr(toks[i], '=');
+        if (!eq || eq == toks[i]) continue;
+        *eq = '\0';
+        if (g_ascii_strcasecmp(toks[i], id) != 0) continue;
+        gint n = sscanf(eq + 1, "%d,%d,%d", c, r, g);
+        if (n >= 2 && *c >= 0 && *r >= 0) { ok = TRUE; if (n < 3 || *g < 0) *g = 0; }
+    }
+    g_strfreev(toks);
+    return ok;
+}
+
+static gboolean w10_saved_pos(UltimateShell *sh, const gchar *id, gint *c, gint *r) {
+    if (!sh || !id || !sh->win10_tile_pos) return FALSE;
+    gboolean ok = FALSE;
+    gchar **toks = g_strsplit(sh->win10_tile_pos, ";", -1);
+    for (gint i = 0; toks && toks[i] && !ok; i++) {
+        gchar *eq = strrchr(toks[i], '=');
+        if (!eq || eq == toks[i]) continue;
+        *eq = '\0';
+        if (g_ascii_strcasecmp(toks[i], id) == 0 && sscanf(eq + 1, "%d,%d", c, r) >= 2 && *c >= 0 && *r >= 0) ok = TRUE;
+    }
+    g_strfreev(toks);
+    return ok;
+}
+
+static gboolean w10_free(guint8 occ[][W10_MAX_COLS], gint c, gint r, gint cw, gint ch) {
+    if (r < 0 || r + ch > W10_MAXR) return FALSE;
+    for (gint rr = r; rr < r + ch; rr++) for (gint cc = c; cc < c + cw; cc++) if (occ[rr][cc]) return FALSE;
+    return TRUE;
+}
+static void w10_mark(guint8 occ[][W10_MAX_COLS], gint c, gint r, gint cw, gint ch) {
+    for (gint rr = r; rr < r + ch; rr++) for (gint cc = c; cc < c + cw; cc++) occ[rr][cc] = 1;
+}
+
+typedef struct { gint idx, c, r; gboolean has; } W10Want;
+static gint w10_want_cmp(gconstpointer a, gconstpointer b) {
+    const W10Want *x = a, *y = b;
+    if (x->has != y->has) return x->has ? -1 : 1;          /* placed tiles first, new ones after */
+    if (!x->has) return x->idx - y->idx;
+    if (x->r != y->r) return x->r - y->r;
+    return x->c - y->c;
+}
+
+/* Where every tile goes. moving (may be NULL) is put at (mc, mr) first; every other tile keeps its
+   saved cell, or moves down until it fits; tiles never placed fill the first free cells.
+   Returns the rows used. */
+static gint w10_layout(StartMenuUI *ui, GPtrArray *tiles, GtkWidget *moving, gint mc, gint mr, W10Cell *out) {
+    static guint8 occ[W10_MAXR][W10_MAX_COLS];
+    memset(occ, 0, sizeof occ);
+    gint cols = win10_cols(ui->shell), rows = 0;
+    guint n = tiles->len;
+    W10Want *want = g_new0(W10Want, MAX(1, n));
+    for (guint i = 0; i < n; i++) {
+        GtkWidget *t = g_ptr_array_index(tiles, i);
+        gchar size = (gchar)GPOINTER_TO_INT(g_object_get_data(G_OBJECT(t), "tile-size"));
+        w10_size_cells(size, &out[i].cw, &out[i].ch);
+        want[i].idx = (gint)i;
+        want[i].has = w10_saved_pos(ui->shell, g_object_get_data(G_OBJECT(t), "tile-id"), &want[i].c, &want[i].r);
+    }
+    /* 1. the tile being dragged goes exactly where the pointer is */
+    for (guint i = 0; moving && i < n; i++) if (g_ptr_array_index(tiles, i) == moving) {
+        gint c = CLAMP(mc, 0, cols - out[i].cw), r = MAX(0, mr);
+        out[i].c = c; out[i].r = r;
+        w10_mark(occ, c, r, out[i].cw, out[i].ch);
+        rows = MAX(rows, r + out[i].ch);
+    }
+    /* 2. the others, top to bottom: their own cell, else pushed down */
+    qsort(want, n, sizeof *want, w10_want_cmp);
+    for (guint k = 0; k < n; k++) {
+        guint i = (guint)want[k].idx;
+        if (g_ptr_array_index(tiles, i) == moving) continue;
+        gint cw = out[i].cw, ch = out[i].ch;
+        gboolean done = FALSE;
+        if (want[k].has) {
+            gint c = CLAMP(want[k].c, 0, cols - cw);
+            for (gint r = want[k].r; r + ch <= W10_MAXR && !done; r++)
+                if (w10_free(occ, c, r, cw, ch)) { out[i].c = c; out[i].r = r; done = TRUE; }
+        }
+        for (gint r = 0; r + ch <= W10_MAXR && !done; r++)          /* new tile: first free cell */
+            for (gint c = 0; c + cw <= cols && !done; c++)
+                if (w10_free(occ, c, r, cw, ch)) { out[i].c = c; out[i].r = r; done = TRUE; }
+        w10_mark(occ, out[i].c, out[i].r, cw, ch);
+        rows = MAX(rows, out[i].r + ch);
+    }
+    g_free(want);
+    return rows;
+}
+
+/* ---- groups: stacked bands, each a name and its own tile cells ---- */
+#define W10_HDR       30      /* group name row */
+#define W10_GROUP_GAP 14
+#define W10_MAX_GROUPS 32
+typedef struct { gint y0, y1, tiles_y; } W10Band;
+static W10Band g_w10_band[W10_MAX_GROUPS + 1];
+static gint    g_w10_nbands = 0;            /* bands from the last layout (index = group) */
+
+static gint w10_group_count(UltimateShell *sh) {
+    gchar **n = g_strsplit(sh->win10_groups && sh->win10_groups[0] ? sh->win10_groups : "Pinned", ";", -1);
+    gint c = MAX(1, (gint)g_strv_length(n));
+    g_strfreev(n);
+    return MIN(c, W10_MAX_GROUPS);
+}
+static gchar *w10_group_name(UltimateShell *sh, gint g) {
+    gchar **n = g_strsplit(sh->win10_groups && sh->win10_groups[0] ? sh->win10_groups : "Pinned", ";", -1);
+    gchar *r = (g >= 0 && g < (gint)g_strv_length(n) && n[g][0]) ? g_strdup(n[g]) : g_strdup(g == 0 ? "Pinned" : "New group");
+    g_strfreev(n);
+    return r;
+}
+static void w10_save_group_names(UltimateShell *sh, GPtrArray *names) {
+    GString *o = g_string_new("");
+    for (guint i = 0; i < names->len; i++) {
+        if (i) g_string_append_c(o, ';');
+        gchar *clean = g_strdelimit(g_strdup(g_ptr_array_index(names, i)), ";", ',');
+        g_string_append(o, clean);
+        g_free(clean);
+    }
+    g_free(sh->win10_groups);
+    sh->win10_groups = g_string_free(o, FALSE);
+    if (sh->channel) xfconf_channel_set_string(sh->channel, "/plugins/ultimateshell/win10_groups", sh->win10_groups);
+}
+
+/* rename: click a group name */
+static void on_w10_group_name_done(GtkEntry *e, GtkWidget *hdr) {
+    StartMenuUI *ui = g_start_ui;
+    gint g = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(hdr), "group-idx"));
+    const gchar *txt = gtk_entry_get_text(e);
+    if (ui && txt && txt[0]) {
+        GPtrArray *names = g_ptr_array_new_with_free_func(g_free);
+        gint n = MAX(w10_group_count(ui->shell), g + 1);
+        for (gint i = 0; i < n; i++) g_ptr_array_add(names, i == g ? g_strdup(txt) : w10_group_name(ui->shell, i));
+        w10_save_group_names(ui->shell, names);
+        g_ptr_array_unref(names);
+        gchar *mk = g_markup_printf_escaped("<b>%s</b>", txt);
+        gtk_label_set_markup(GTK_LABEL(gtk_bin_get_child(GTK_BIN(hdr))), mk);
+        g_free(mk);
+    }
+    GtkWidget *pop = gtk_widget_get_ancestor(GTK_WIDGET(e), GTK_TYPE_POPOVER);
+    if (pop) gtk_popover_popdown(GTK_POPOVER(pop));
+}
+static void on_w10_group_hdr_clicked(GtkButton *b, gpointer d) {
+    GtkWidget *pop = gtk_popover_new(GTK_WIDGET(b));
+    GtkWidget *e = gtk_entry_new();
+    gchar *cur = w10_group_name(g_start_ui->shell, GPOINTER_TO_INT(g_object_get_data(G_OBJECT(b), "group-idx")));
+    gtk_entry_set_text(GTK_ENTRY(e), cur);
+    g_free(cur);
+    gtk_entry_set_placeholder_text(GTK_ENTRY(e), "Name group");
+    gtk_container_set_border_width(GTK_CONTAINER(pop), 6);
+    gtk_container_add(GTK_CONTAINER(pop), e);
+    g_signal_connect(e, "activate", G_CALLBACK(on_w10_group_name_done), b);
+    gtk_widget_show_all(pop);
+    gtk_popover_popup(GTK_POPOVER(pop));
+    gtk_widget_grab_focus(e);
+}
+static GtkWidget *w10_make_group_header(StartMenuUI *ui, gint g, const gchar *name) {
+    GtkWidget *b = gtk_button_new();
+    gtk_button_set_relief(GTK_BUTTON(b), GTK_RELIEF_NONE);
+    GtkWidget *l = gtk_label_new(NULL);
+    gchar *mk = g_markup_printf_escaped("<b>%s</b>", name);
+    gtk_label_set_markup(GTK_LABEL(l), mk);
+    g_free(mk);
+    gtk_label_set_xalign(GTK_LABEL(l), 0.0);
+    gtk_container_add(GTK_CONTAINER(b), l);
+    gtk_widget_set_tooltip_text(b, "Click to rename this group");
+    gtk_style_context_add_class(gtk_widget_get_style_context(b), "win10-group-hdr");
+    g_object_set_data(G_OBJECT(b), "group-idx", GINT_TO_POINTER(g));
+    gtk_widget_set_size_request(b, win10_cols(ui->shell) * (W10_CELL + W10_GAP) - W10_GAP, W10_HDR - 4);
+    g_signal_connect(b, "clicked", G_CALLBACK(on_w10_group_hdr_clicked), NULL);
+    return b;
+}
+
+/* lay every group out; moving (may be NULL) goes to group mg at (mc, mr). mg == number of groups
+   means "a new group below the others" (shown while dragging there). */
+static void w10_place(StartMenuUI *ui, GtkWidget *moving, gint mg, gint mc, gint mr) {
+    GtkWidget *grid = ui->win10_tiles_grid;
+    GPtrArray *tiles = GTK_IS_FIXED(grid) ? g_object_get_data(G_OBJECT(grid), "w10-tiles") : NULL;
+    GPtrArray *hdrs  = GTK_IS_FIXED(grid) ? g_object_get_data(G_OBJECT(grid), "w10-headers") : NULL;
+    if (!tiles || tiles->len == 0 || !hdrs) return;
+    gint cols = win10_cols(ui->shell), step = W10_CELL + W10_GAP;
+    gint ng = (gint)hdrs->len - 1;                       /* last header = the "new group" placeholder */
+    gint y = 0;
+    g_w10_nbands = 0;
+    W10Cell *pos = g_new0(W10Cell, tiles->len);
+    for (gint g = 0; g <= ng; g++) {
+        GPtrArray *sub = g_ptr_array_new();
+        for (guint i = 0; i < tiles->len; i++) {
+            GtkWidget *t = g_ptr_array_index(tiles, i);
+            if (t == moving) continue;
+            if (GPOINTER_TO_INT(g_object_get_data(G_OBJECT(t), "tile-group")) == g) g_ptr_array_add(sub, t);
+        }
+        if (moving && mg == g) g_ptr_array_add(sub, moving);
+        GtkWidget *hdr = g_ptr_array_index(hdrs, g);
+        if (sub->len == 0) {                             /* empty group: not shown */
+            gtk_widget_hide(hdr);
+            g_w10_band[g].y0 = g_w10_band[g].y1 = g_w10_band[g].tiles_y = -1;
+            g_ptr_array_unref(sub);
+            if (g < W10_MAX_GROUPS + 1) g_w10_nbands = g + 1;
+            continue;
+        }
+        gtk_widget_show(hdr);
+        gtk_fixed_move(GTK_FIXED(grid), hdr, 0, y);
+        gint rows = w10_layout(ui, sub, (moving && mg == g) ? moving : NULL, mc, mr, pos);
+        gint ty = y + W10_HDR;
+        for (guint i = 0; i < sub->len; i++) {
+            GtkWidget *t = g_ptr_array_index(sub, i);
+            gtk_fixed_move(GTK_FIXED(grid), t, pos[i].c * step, ty + pos[i].r * step);
+            g_object_set_data(G_OBJECT(t), "cell-c", GINT_TO_POINTER(pos[i].c));
+            g_object_set_data(G_OBJECT(t), "cell-r", GINT_TO_POINTER(pos[i].r));
+            g_object_set_data(G_OBJECT(t), "cell-g", GINT_TO_POINTER(g));
+        }
+        g_w10_band[g].y0 = y;
+        g_w10_band[g].tiles_y = ty;
+        g_w10_band[g].y1 = ty + rows * step;
+        y = g_w10_band[g].y1 + W10_GROUP_GAP;
+        g_w10_nbands = g + 1;
+        g_ptr_array_unref(sub);
+    }
+    g_free(pos);
+    gtk_widget_set_size_request(grid, cols * step - W10_GAP, y + 2 * step);   /* + room for a new group */
+}
+
+/* remember cells and groups; empty groups go, the others are renumbered in order */
+static void w10_save_positions(StartMenuUI *ui) {
+    GtkWidget *grid = ui->win10_tiles_grid;
+    GPtrArray *tiles = GTK_IS_FIXED(grid) ? g_object_get_data(G_OBJECT(grid), "w10-tiles") : NULL;
+    GPtrArray *hdrs  = GTK_IS_FIXED(grid) ? g_object_get_data(G_OBJECT(grid), "w10-headers") : NULL;
+    if (!tiles || !hdrs) return;
+    gint total = (gint)hdrs->len;
+    gint *map = g_new0(gint, total + 1);
+    for (gint g = 0; g <= total; g++) map[g] = -1;
+    for (guint i = 0; i < tiles->len; i++) {
+        gint g = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(g_ptr_array_index(tiles, i)), "cell-g"));
+        if (g >= 0 && g <= total) map[g] = 0;
+    }
+    GPtrArray *names = g_ptr_array_new_with_free_func(g_free);
+    gint next = 0;
+    for (gint g = 0; g <= total; g++) if (map[g] == 0) { map[g] = next++; g_ptr_array_add(names, w10_group_name(ui->shell, g)); }
+    if (names->len == 0) g_ptr_array_add(names, g_strdup("Pinned"));
+    w10_save_group_names(ui->shell, names);
+    g_ptr_array_unref(names);
+
+    GString *out = g_string_new("");
+    for (guint i = 0; i < tiles->len; i++) {
+        GObject *t = g_ptr_array_index(tiles, i);
+        const gchar *id = g_object_get_data(t, "tile-id");
+        if (!id) continue;
+        gint g = GPOINTER_TO_INT(g_object_get_data(t, "cell-g"));
+        gint ng = (g >= 0 && g <= total && map[g] >= 0) ? map[g] : 0;
+        g_object_set_data(t, "tile-group", GINT_TO_POINTER(ng));
+        if (out->len) g_string_append_c(out, ';');
+        g_string_append_printf(out, "%s=%d,%d,%d", id, GPOINTER_TO_INT(g_object_get_data(t, "cell-c")),
+                               GPOINTER_TO_INT(g_object_get_data(t, "cell-r")), ng);
+    }
+    g_free(map);
+    g_free(ui->shell->win10_tile_pos);
+    ui->shell->win10_tile_pos = g_string_free(out, FALSE);
+    if (ui->shell->channel)
+        xfconf_channel_set_string(ui->shell->channel, "/plugins/ultimateshell/win10_tile_pos", ui->shell->win10_tile_pos);
+}
+
+/* (re)make the group name buttons: one per group + the hidden "New group" placeholder */
+static void w10_make_headers(StartMenuUI *ui) {
+    GtkWidget *grid = ui->win10_tiles_grid;
+    GPtrArray *old = g_object_get_data(G_OBJECT(grid), "w10-headers");
+    for (guint i = 0; old && i < old->len; i++) gtk_widget_destroy(g_ptr_array_index(old, i));
+    GPtrArray *hdrs = g_ptr_array_new();
+    gint n = w10_group_count(ui->shell);
+    for (gint g = 0; g <= n; g++) {
+        gchar *nm = (g < n) ? w10_group_name(ui->shell, g) : g_strdup("New group");
+        GtkWidget *h = w10_make_group_header(ui, g, nm);
+        g_free(nm);
+        gtk_fixed_put(GTK_FIXED(grid), h, 0, 0);
+        gtk_widget_set_no_show_all(h, TRUE);
+        g_ptr_array_add(hdrs, h);
+    }
+    g_object_set_data_full(G_OBJECT(grid), "w10-headers", hdrs, (GDestroyNotify)g_ptr_array_unref);
+}
+
+static void win10_fill_tiles(StartMenuUI *ui) {
+    GtkWidget *grid = ui->win10_tiles_grid;
+    if (!GTK_IS_FIXED(grid)) return;
+    g_object_set_data(G_OBJECT(grid), "w10-headers", NULL);
+    GList *kids = gtk_container_get_children(GTK_CONTAINER(grid));
+    for (GList *l = kids; l; l = l->next) gtk_widget_destroy(GTK_WIDGET(l->data));
+    g_list_free(kids);
+
+    ensure_default_favorites(ui->shell);
+    GList *apps = get_sorted_apps_cached(ui);
+    const gint W10_COLS = win10_cols(ui->shell);
+    gint ngroups = w10_group_count(ui->shell);
+    GPtrArray *tiles = g_ptr_array_new();
+    gchar **toks = g_strsplit(ui->shell->start_favorites ? ui->shell->start_favorites : "", ";", -1);
+    for (gint t = 0; toks && toks[t]; t++) {
+        gchar *tok = g_strstrip(toks[t]);
+        if (!tok[0]) continue;
+        GAppInfo *app = NULL;
+        for (GList *l = apps; l; l = l->next) {
+            const gchar *id = g_app_info_get_id(l->data), *ex = g_app_info_get_executable(l->data);
+            if ((id && g_ascii_strcasecmp(id, tok) == 0) || (ex && g_ascii_strcasecmp(ex, tok) == 0)) { app = l->data; break; }
+        }
+        if (!app || !g_app_info_should_show(app)) continue;
+        gchar size = win10_tile_size(ui->shell, get_app_id_token(app));
+        GtkWidget *tile = win10_make_tile(ui, app, size);
+        gint c, r, g;
+        w10_saved_pos3(ui->shell, get_app_id_token(app), &c, &r, &g);
+        g_object_set_data(G_OBJECT(tile), "tile-size", GINT_TO_POINTER((gint)size));
+        g_object_set_data(G_OBJECT(tile), "tile-group", GINT_TO_POINTER(CLAMP(g, 0, ngroups - 1)));
+        g_object_set_data_full(G_OBJECT(tile), "tile-id", g_strdup(get_app_id_token(app)), g_free);
+        gtk_fixed_put(GTK_FIXED(grid), tile, 0, 0);
+        g_ptr_array_add(tiles, tile);
+    }
+    g_strfreev(toks);
+    g_object_set_data_full(G_OBJECT(grid), "w10-tiles", tiles, (GDestroyNotify)g_ptr_array_unref);
+    if (tiles->len == 0) {
+        GtkWidget *hint = gtk_label_new("Right-click an app and choose\n“Add to Favorites” to pin it here.");
+        gtk_style_context_add_class(gtk_widget_get_style_context(hint), "dim-label");
+        gtk_widget_set_size_request(hint, W10_COLS * (W10_CELL + W10_GAP) - W10_GAP, 2 * W10_CELL);
+        gtk_fixed_put(GTK_FIXED(grid), hint, 0, 0);
+        gtk_widget_set_size_request(grid, W10_COLS * (W10_CELL + W10_GAP) - W10_GAP, 2 * W10_CELL);
+    } else {
+        w10_make_headers(ui);
+        w10_place(ui, NULL, 0, 0, 0);
+        w10_save_positions(ui);
+        w10_make_headers(ui);              /* names may have been renumbered */
+        w10_place(ui, NULL, 0, 0, 0);
+    }
+    gtk_widget_show_all(grid);
+}
+
+/* ---- dragging: the tile follows the pointer into a group's cell, or into a new group below ---- */
+static GtkWidget *g_w10_moving = NULL;
+static gboolean w10_after_drop(gpointer d) {
+    g_w10_moving = NULL;
+    if (g_start_ui) {
+        refresh_win11_pinned(g_start_ui);
+        if (g_start_ui->popup_win) clear_context_menu_guard_idle(g_start_ui->popup_win);   /* focus back */
+    }
+    return G_SOURCE_REMOVE;
+}
+static gint       g_w10_tg = -1, g_w10_tc = -1, g_w10_tr = -1;
+static guint      g_w10_restore_id = 0;
+
+static gboolean on_w10_area_motion(GtkWidget *box, GdkDragContext *ctx, gint x, gint y, guint t, StartMenuUI *ui) {
+    GtkWidget *grid = ui->win10_tiles_grid;
+    GPtrArray *hdrs = GTK_IS_FIXED(grid) ? g_object_get_data(G_OBJECT(grid), "w10-headers") : NULL;
+    if (!hdrs || !g_w10_moving) { gdk_drag_status(ctx, 0, t); return FALSE; }
+    if (g_w10_restore_id) { g_source_remove(g_w10_restore_id); g_w10_restore_id = 0; }
+    gint gx = 0, gy = 0;
+    gtk_widget_translate_coordinates(box, grid, x, y, &gx, &gy);
+    gint step = W10_CELL + W10_GAP;
+    gint ng = (gint)hdrs->len - 1;
+    /* which group band is under the pointer? below the last one = a new group */
+    gint g = -1, last = -1;
+    for (gint i = 0; i < g_w10_nbands && i < ng; i++) {
+        if (g_w10_band[i].y0 < 0) continue;
+        last = i;
+        if (gy < g_w10_band[i].y1 + W10_GROUP_GAP / 2) { g = i; break; }
+    }
+    gint origin = 0;
+    if (g < 0) {
+        gint bottom = (last >= 0) ? g_w10_band[last].y1 : 0;
+        if (last >= 0 && gy < bottom + W10_GROUP_GAP + W10_HDR / 2) g = last;      /* just under it: same group */
+        else { g = ng; origin = (last >= 0 ? bottom + W10_GROUP_GAP : 0) + W10_HDR; }
+    }
+    if (g < ng) origin = g_w10_band[g].tiles_y;
+    gchar size = (gchar)GPOINTER_TO_INT(g_object_get_data(G_OBJECT(g_w10_moving), "tile-size"));
+    gint cw, ch; w10_size_cells(size, &cw, &ch);
+    gint c = (gint)floor((gdouble)gx / step - cw / 2.0 + 0.5);
+    gint r = (gint)floor((gdouble)(gy - origin) / step - ch / 2.0 + 0.5);
+    c = CLAMP(c, 0, win10_cols(ui->shell) - cw);
+    r = CLAMP(r, 0, W10_MAXR - ch);
+    if (g == ng) r = 0;                         /* a new group starts with this tile */
+    if (g != g_w10_tg || c != g_w10_tc || r != g_w10_tr) {
+        g_w10_tg = g; g_w10_tc = c; g_w10_tr = r;
+        w10_place(ui, g_w10_moving, g, c, r);
+    }
+    gdk_drag_status(ctx, GDK_ACTION_MOVE, t);
+    return TRUE;
+}
+
+static gboolean w10_restore_idle(gpointer d) {
+    StartMenuUI *ui = d;
+    g_w10_restore_id = 0;
+    g_w10_tg = g_w10_tc = g_w10_tr = -1;
+    w10_place(ui, NULL, 0, 0, 0);            /* back to the saved cells */
+    return G_SOURCE_REMOVE;
+}
+
+static void on_w10_area_leave(GtkWidget *box, GdkDragContext *ctx, guint t, StartMenuUI *ui) {
+    if (g_w10_restore_id) g_source_remove(g_w10_restore_id);
+    g_w10_restore_id = g_timeout_add(120, w10_restore_idle, ui);
+}
+
+static gboolean on_w10_area_drop(GtkWidget *box, GdkDragContext *ctx, gint x, gint y, guint t, StartMenuUI *ui) {
+    if (g_w10_restore_id) { g_source_remove(g_w10_restore_id); g_w10_restore_id = 0; }
+    if (g_w10_moving && g_w10_tc >= 0) {
+        GPtrArray *hdrs = g_object_get_data(G_OBJECT(ui->win10_tiles_grid), "w10-headers");
+        gboolean new_group = hdrs && g_w10_tg == (gint)hdrs->len - 1;
+        w10_place(ui, g_w10_moving, g_w10_tg, g_w10_tc, g_w10_tr);
+        if (new_group) {                          /* name it "New group" (click to rename) */
+            gint n = w10_group_count(ui->shell);
+            GPtrArray *names = g_ptr_array_new_with_free_func(g_free);
+            for (gint i = 0; i < n; i++) g_ptr_array_add(names, w10_group_name(ui->shell, i));
+            g_ptr_array_add(names, g_strdup("New group"));
+            w10_save_group_names(ui->shell, names);
+            g_ptr_array_unref(names);
+        }
+        w10_save_positions(ui);                   /* what you saw is what is kept; empty groups go */
+        g_timeout_add(250, w10_after_drop, NULL);   /* rebuild group names once the drag has fully ended */
+    }
+    g_w10_tg = g_w10_tc = g_w10_tr = -1;
+    gtk_drag_finish(ctx, TRUE, FALSE, t);
+    return TRUE;
+}
+
+static void on_w10_tile_drag_begin(GtkWidget *w, GdkDragContext *ctx, gpointer d) { g_w10_moving = w; g_w10_tg = g_w10_tc = g_w10_tr = -1; }
+static void on_w10_tile_drag_end(GtkWidget *w, GdkDragContext *ctx, StartMenuUI *ui) {
+    g_w10_moving = NULL;
+    if (g_w10_tc >= 0) w10_restore_idle(ui);      /* dropped elsewhere / cancelled: back as it was */
+}
+
+static void on_win10_resize_tile(GtkMenuItem *mi, GAppInfo *app) {
+    if (!g_start_ui || !app) return;
+    if (GTK_IS_CHECK_MENU_ITEM(mi) && !gtk_check_menu_item_get_active(GTK_CHECK_MENU_ITEM(mi))) return;
+    gchar size = (gchar)GPOINTER_TO_INT(g_object_get_data(G_OBJECT(mi), "tile-size"));
+    win10_set_tile_size(g_start_ui->shell, get_app_id_token(app), size);
+    win10_fill_tiles(g_start_ui);
+}
+
+/* "Resize ▸ Small / Medium / Wide" for a pinned tile (Win10 style only) */
+static void win10_append_resize_menu(GtkWidget *menu, GAppInfo *app) {
+    if (!g_start_ui || !g_start_ui->shell || g_start_ui->shell->start_style != START_STYLE_WIN10) return;
+    if (!is_app_in_favorites(g_start_ui->shell, app)) return;
+    gchar cur = win10_tile_size(g_start_ui->shell, get_app_id_token(app));
+    GtkWidget *it = gtk_menu_item_new_with_label("Resize");
+    GtkWidget *sub = gtk_menu_new();
+    gtk_style_context_add_class(gtk_widget_get_style_context(sub), "ultimate-themed-menu");
+    const struct { const gchar *lbl; gchar s; } opts[] = { { "Small", 's' }, { "Medium", 'm' }, { "Wide", 'w' } };
+    GSList *grp = NULL;
+    for (guint i = 0; i < G_N_ELEMENTS(opts); i++) {
+        GtkWidget *r = gtk_radio_menu_item_new_with_label(grp, opts[i].lbl);
+        grp = gtk_radio_menu_item_get_group(GTK_RADIO_MENU_ITEM(r));
+        gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(r), opts[i].s == cur);
+        g_object_set_data(G_OBJECT(r), "tile-size", GINT_TO_POINTER((gint)opts[i].s));
+        g_signal_connect(r, "toggled", G_CALLBACK(on_win10_resize_tile), app);
+        gtk_menu_shell_append(GTK_MENU_SHELL(sub), r);
+    }
+    gtk_menu_item_set_submenu(GTK_MENU_ITEM(it), sub);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), it);
+}
+
+/* A–Z list: click a letter header → letter picker → jump to that letter */
+static void on_win10_letter_clicked(GtkButton *b, StartMenuUI *ui) {
+    GtkWidget *target = g_object_get_data(G_OBJECT(b), "hdr-row");
+    if (ui->win10_list_stack) gtk_stack_set_visible_child_name(GTK_STACK(ui->win10_list_stack), "list");
+    if (!GTK_IS_WIDGET(target) || !GTK_IS_SCROLLED_WINDOW(ui->win10_list_scroll)) return;
+    GtkAllocation a; gtk_widget_get_allocation(target, &a);
+    GtkAdjustment *adj = gtk_scrolled_window_get_vadjustment(GTK_SCROLLED_WINDOW(ui->win10_list_scroll));
+    gtk_adjustment_set_value(adj, a.y);
+}
+
+static void win10_show_letter_picker(StartMenuUI *ui) {
+    GtkWidget *page = ui->win10_list_stack ? gtk_stack_get_child_by_name(GTK_STACK(ui->win10_list_stack), "letters") : NULL;
+    if (!GTK_IS_GRID(page)) return;
+    GList *kids = gtk_container_get_children(GTK_CONTAINER(page));
+    for (GList *l = kids; l; l = l->next) gtk_widget_destroy(GTK_WIDGET(l->data));
+    g_list_free(kids);
+    const gchar *letters = "#ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    GList *rows = gtk_container_get_children(GTK_CONTAINER(ui->list_box));
+    for (gint i = 0; letters[i]; i++) {
+        gchar lb[2] = { letters[i], 0 };
+        GtkWidget *btn = gtk_button_new_with_label(lb);
+        gtk_button_set_relief(GTK_BUTTON(btn), GTK_RELIEF_NONE);
+        gtk_style_context_add_class(gtk_widget_get_style_context(btn), "win10-letter");
+        gtk_widget_set_size_request(btn, 44, 40);
+        GtkWidget *hit = NULL;
+        for (GList *l = rows; l; l = l->next) {
+            const gchar *hl = g_object_get_data(G_OBJECT(l->data), "alpha-letter");
+            if (hl && g_strcmp0(hl, lb) == 0) { hit = l->data; break; }
+        }
+        gtk_widget_set_sensitive(btn, hit != NULL);
+        g_object_set_data(G_OBJECT(btn), "hdr-row", hit);
+        g_signal_connect(btn, "clicked", G_CALLBACK(on_win10_letter_clicked), ui);
+        gtk_grid_attach(GTK_GRID(page), btn, i % 4, i / 4, 1, 1);
+    }
+    g_list_free(rows);
+    gtk_widget_show_all(page);
+    gtk_stack_set_visible_child_name(GTK_STACK(ui->win10_list_stack), "letters");
+}
+
+static GtkWidget *win10_rail_button(const gchar *icon, const gchar *tip, GCallback cb, gpointer data) {
+    GtkWidget *b = gtk_button_new_from_icon_name(icon, GTK_ICON_SIZE_LARGE_TOOLBAR);
+    gtk_button_set_relief(GTK_BUTTON(b), GTK_RELIEF_NONE);
+    gtk_style_context_add_class(gtk_widget_get_style_context(b), "win10-rail-btn");
+    gtk_widget_set_tooltip_text(b, tip);
+    gtk_widget_set_size_request(b, 44, 40);
+    if (cb) g_signal_connect(b, "clicked", cb, data);
+    return b;
+}
+
+static void on_win10_power_item(GtkMenuItem *mi, const gchar *action) {
+    if (g_strcmp0(action, "switch") == 0) on_session_cmd(NULL, "dm-tool switch-to-greeter");
+    else if (g_strcmp0(action, "lock") == 0) on_session_cmd(NULL, "xflock4");
+    else if (g_strcmp0(action, "suspend") == 0) on_session_cmd(NULL, "systemctl suspend");
+    else on_confirm_power_action(NULL, action);
+}
+
+static void on_win10_power_clicked(GtkButton *b, StartMenuUI *ui) {
+    g_object_set_data(G_OBJECT(ui->popup_win), "context-menu-open", GINT_TO_POINTER(1));
+    GtkWidget *menu = gtk_menu_new();
+    gtk_menu_set_reserve_toggle_size(GTK_MENU(menu), FALSE);
+    gtk_style_context_add_class(gtk_widget_get_style_context(menu), "ultimate-themed-menu");
+    g_signal_connect(menu, "deactivate", G_CALLBACK(on_app_context_menu_deactivate), ui->popup_win);
+    const struct { const gchar *lbl, *act; } it[] = {
+        { "Lock", "lock" }, { "Sleep", "suspend" }, { "Sign out", "logout" }, { "Restart", "restart" }, { "Shut down", "shutdown" } };
+    for (guint i = 0; i < G_N_ELEMENTS(it); i++) {
+        GtkWidget *mi = gtk_menu_item_new_with_label(it[i].lbl);
+        g_signal_connect(mi, "activate", G_CALLBACK(on_win10_power_item), (gpointer)it[i].act);
+        gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi);
+    }
+    gtk_widget_show_all(menu);
+    gtk_menu_popup_at_widget(GTK_MENU(menu), GTK_WIDGET(b), GDK_GRAVITY_NORTH_EAST, GDK_GRAVITY_SOUTH_WEST, NULL);
+}
+
+/* Classic (Windows 7): [ Shut down ][ ▸ ] - the arrow opens the other session actions */
+static void on_classic_power_more(GtkButton *b, StartMenuUI *ui) {
+    g_object_set_data(G_OBJECT(ui->popup_win), "context-menu-open", GINT_TO_POINTER(1));
+    GtkWidget *menu = gtk_menu_new();
+    gtk_menu_set_reserve_toggle_size(GTK_MENU(menu), FALSE);
+    gtk_style_context_add_class(gtk_widget_get_style_context(menu), "ultimate-themed-menu");
+    g_signal_connect(menu, "deactivate", G_CALLBACK(on_app_context_menu_deactivate), ui->popup_win);
+    gchar *dm = g_find_program_in_path("dm-tool");
+    const struct { const gchar *lbl, *act; gboolean show; } it[] = {
+        { "Switch user", "switch", dm != NULL }, { "Log off", "logout", TRUE }, { "Lock", "lock", TRUE },
+        { "Restart", "restart", TRUE }, { "Sleep", "suspend", TRUE } };
+    g_free(dm);
+    for (guint i = 0; i < G_N_ELEMENTS(it); i++) {
+        if (!it[i].show) continue;
+        GtkWidget *mi = gtk_menu_item_new_with_label(it[i].lbl);
+        g_signal_connect(mi, "activate", G_CALLBACK(on_win10_power_item), (gpointer)it[i].act);
+        gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi);
+    }
+    gtk_widget_show_all(menu);
+    gtk_menu_popup_at_widget(GTK_MENU(menu), GTK_WIDGET(b), GDK_GRAVITY_NORTH_EAST, GDK_GRAVITY_SOUTH_EAST, NULL);
+}
+
+static GtkWidget *classic_power_button(StartMenuUI *ui) {
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_style_context_add_class(gtk_widget_get_style_context(box), "linked");
+    GtkWidget *sd = gtk_button_new_with_label("Shut down");
+    g_signal_connect(sd, "clicked", G_CALLBACK(on_confirm_power_action), "shutdown");
+    GtkWidget *more = gtk_button_new_with_label("▸");
+    gtk_widget_set_tooltip_text(more, "Switch user, Log off, Lock, Restart, Sleep");
+    g_signal_connect(more, "clicked", G_CALLBACK(on_classic_power_more), ui);
+    gtk_box_pack_start(GTK_BOX(box), sd, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(box), more, FALSE, FALSE, 0);
+    gtk_widget_set_valign(box, GTK_ALIGN_CENTER);
+    return box;
+}
+
+static void build_win10_menu(StartMenuUI *ui) {
+    UltimateShell *shell = ui->shell;
+    gint init_w = 760, init_h = 600;
+    get_saved_or_default_style_size(shell, START_STYLE_WIN10, &init_w, &init_h);
+    {   /* width follows Grid Columns: rail + A–Z list + exactly the tile columns */
+        gint c = win10_cols(shell);
+        gint tiles_w = c * W10_CELL + (c - 1) * W10_GAP;
+        init_w = shell->win10_show_tiles ? 52 + 250 + tiles_w + 28 + 14 : 52 + 250 + 16;
+    }
+    gtk_window_set_resizable(GTK_WINDOW(ui->popup_win), TRUE);
+    gtk_widget_set_size_request(ui->popup_win, init_w, init_h);
+    gtk_window_resize(GTK_WINDOW(ui->popup_win), init_w, init_h);
+    gtk_container_set_border_width(GTK_CONTAINER(ui->root_container), 0);
+    gtk_box_set_spacing(GTK_BOX(ui->root_container), 0);
+    gtk_entry_set_placeholder_text(GTK_ENTRY(ui->search_entry), "Type here to search");
+
+    GtkWidget *cols = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+
+    /* 1. rail: account up top, places + power at the bottom */
+    GtkWidget *rail = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+    gtk_style_context_add_class(gtk_widget_get_style_context(rail), "win10-rail");
+    gtk_widget_set_margin_top(rail, 6); gtk_widget_set_margin_bottom(rail, 6);
+    gtk_widget_set_margin_start(rail, 4); gtk_widget_set_margin_end(rail, 4);
+    if (shell->start_show_user_header) {
+        GtkWidget *av = create_circular_avatar_widget(30);
+        gtk_widget_set_tooltip_text(av, g_get_user_name());
+        gtk_widget_set_margin_bottom(av, 6);
+        gtk_box_pack_start(GTK_BOX(rail), av, FALSE, FALSE, 4);
+    }
+    gtk_box_pack_end(GTK_BOX(rail), win10_rail_button("system-shutdown-symbolic", "Power", G_CALLBACK(on_win10_power_clicked), ui), FALSE, FALSE, 0);
+    gtk_box_pack_end(GTK_BOX(rail), win10_rail_button("preferences-system-symbolic", "Settings", G_CALLBACK(on_place_shortcut_clicked), "settings"), FALSE, FALSE, 0);
+    gtk_box_pack_end(GTK_BOX(rail), win10_rail_button("folder-pictures-symbolic", "Pictures", G_CALLBACK(on_place_shortcut_clicked), "pic"), FALSE, FALSE, 0);
+    gtk_box_pack_end(GTK_BOX(rail), win10_rail_button("folder-documents-symbolic", "Documents", G_CALLBACK(on_place_shortcut_clicked), "docs"), FALSE, FALSE, 0);
+
+    /* 2. A–Z list (with search on top or bottom) */
+    GtkWidget *mid = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_widget_set_margin_top(mid, 10); gtk_widget_set_margin_bottom(mid, 10);
+    gtk_widget_set_size_request(mid, 250, -1);
+    ui->win10_list_scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(ui->win10_list_scroll), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+    ui->list_box = gtk_list_box_new();
+    gtk_list_box_set_selection_mode(GTK_LIST_BOX(ui->list_box), GTK_SELECTION_NONE);
+    gtk_list_box_set_filter_func(GTK_LIST_BOX(ui->list_box), filter_list_func, ui, NULL);
+    g_signal_connect(ui->list_box, "row-activated", G_CALLBACK(on_app_row_activated), ui);
+    populate_app_list(ui, ui->list_box, TRUE);
+    {   /* letter headers open the letter picker */
+        GList *rows = gtk_container_get_children(GTK_CONTAINER(ui->list_box));
+        for (GList *l = rows; l; l = l->next)
+            if (g_object_get_data(G_OBJECT(l->data), "is-alpha-header"))
+                gtk_list_box_row_set_activatable(GTK_LIST_BOX_ROW(l->data), TRUE);
+        g_list_free(rows);
+    }
+    gtk_container_add(GTK_CONTAINER(ui->win10_list_scroll), ui->list_box);
+    GtkWidget *letters = gtk_grid_new();
+    gtk_grid_set_row_spacing(GTK_GRID(letters), 4);
+    gtk_grid_set_column_spacing(GTK_GRID(letters), 4);
+    gtk_widget_set_halign(letters, GTK_ALIGN_CENTER);
+    gtk_widget_set_valign(letters, GTK_ALIGN_CENTER);
+    ui->win10_list_stack = gtk_stack_new();
+    gtk_stack_set_transition_type(GTK_STACK(ui->win10_list_stack), GTK_STACK_TRANSITION_TYPE_CROSSFADE);
+    gtk_stack_add_named(GTK_STACK(ui->win10_list_stack), ui->win10_list_scroll, "list");
+    gtk_stack_add_named(GTK_STACK(ui->win10_list_stack), letters, "letters");
+    gboolean search_top = should_place_search_top(shell, FALSE);
+    if (search_top) gtk_box_pack_start(GTK_BOX(mid), ui->search_entry, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(mid), ui->win10_list_stack, TRUE, TRUE, 0);
+    if (!search_top) gtk_box_pack_start(GTK_BOX(mid), ui->search_entry, FALSE, FALSE, 0);
+
+    /* 3. tiles */
+    ui->win10_tiles_pane = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(ui->win10_tiles_pane), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+    GtkWidget *tiles_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_widget_set_margin_start(tiles_box, 14); gtk_widget_set_margin_end(tiles_box, 14);
+    gtk_widget_set_margin_top(tiles_box, 12);
+    GtkWidget *ttl = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(ttl), "<b>Pinned</b>");
+    gtk_label_set_xalign(GTK_LABEL(ttl), 0.0);
+    ui->win10_tiles_grid = gtk_fixed_new();        /* tiles at exact cell positions */
+    gtk_widget_set_halign(ui->win10_tiles_grid, GTK_ALIGN_START);
+    gtk_widget_destroy(ttl);                       /* each group shows its own name now */
+    gtk_box_pack_start(GTK_BOX(tiles_box), ui->win10_tiles_grid, FALSE, FALSE, 0);
+    gtk_container_add(GTK_CONTAINER(ui->win10_tiles_pane), tiles_box);
+    gtk_widget_set_vexpand(tiles_box, TRUE);       /* drop anywhere in the pane */
+    gtk_drag_dest_set(tiles_box, 0, g_fav_target, 1, GDK_ACTION_MOVE);
+    g_signal_connect(tiles_box, "drag-motion", G_CALLBACK(on_w10_area_motion), ui);
+    g_signal_connect(tiles_box, "drag-leave", G_CALLBACK(on_w10_area_leave), ui);
+    g_signal_connect(tiles_box, "drag-drop", G_CALLBACK(on_w10_area_drop), ui);
+    win10_fill_tiles(ui);
+
+    gtk_box_pack_start(GTK_BOX(cols), rail, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(cols), mid, FALSE, TRUE, 0);
+    if (shell->win10_show_tiles) gtk_box_pack_start(GTK_BOX(cols), ui->win10_tiles_pane, TRUE, TRUE, 0);
+    else { gtk_widget_destroy(ui->win10_tiles_pane); ui->win10_tiles_pane = NULL; ui->win10_tiles_grid = NULL; }
+    if (!shell->win10_show_tiles) gtk_box_set_child_packing(GTK_BOX(cols), mid, TRUE, TRUE, 0, GTK_PACK_START);
+    gtk_box_pack_start(GTK_BOX(ui->root_container), cols, TRUE, TRUE, 0);
+}
+
+/* =========================================================================
+ * GNOME App Grid: open windows overview above a paged app grid
+ * ========================================================================= */
+/* ---- page peeks: the edge column of the previous / next page, dimmed ---- */
+static gboolean on_gnome_peek_press(GtkWidget *eb, GdkEventButton *ev, StartMenuUI *ui) {
+    if (ev->type != GDK_BUTTON_PRESS || ev->button != 1) return FALSE;
+    gint dir = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(eb), "peek-dir"));
+    fs_go_to_page(ui, ui->fs_current_page + dir);
+    return TRUE;
+}
+
+static GtkWidget *gnome_make_peek(StartMenuUI *ui, gint dir) {
+    GtkWidget *eb = gtk_event_box_new();
+    gtk_event_box_set_visible_window(GTK_EVENT_BOX(eb), FALSE);
+    gtk_widget_add_events(eb, GDK_BUTTON_PRESS_MASK | GDK_SCROLL_MASK | GDK_SMOOTH_SCROLL_MASK);
+    g_object_set_data(G_OBJECT(eb), "peek-dir", GINT_TO_POINTER(dir));
+    g_signal_connect(eb, "button-press-event", G_CALLBACK(on_gnome_peek_press), ui);
+    g_signal_connect(eb, "scroll-event", G_CALLBACK(on_fs_deck_scroll), ui);
+    GtkWidget *col = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+    gtk_widget_set_valign(col, GTK_ALIGN_CENTER);
+    gtk_container_add(GTK_CONTAINER(eb), col);
+    gtk_widget_set_opacity(eb, 0.35);
+    return eb;
+}
+
+static void gnome_fill_peek(StartMenuUI *ui, GtkWidget *peek, gint page, gboolean last_col) {
+    if (!GTK_IS_WIDGET(peek)) return;
+    GtkWidget *col = gtk_bin_get_child(GTK_BIN(peek));
+    GList *kids = gtk_container_get_children(GTK_CONTAINER(col));
+    for (GList *l = kids; l; l = l->next) gtk_widget_destroy(GTK_WIDGET(l->data));
+    g_list_free(kids);
+    gint st = START_STYLE_GNOME;
+    gint icon_px = (ui->shell->start_style_grid_icon[st] > 0) ? CLAMP(ui->shell->start_style_grid_icon[st], 32, 96) : 48;
+    gtk_widget_set_size_request(peek, icon_px + 24, -1);     /* one icon column of the neighbouring page */
+    if (!ui->fs_page_apps || page < 0 || page >= (gint)ui->fs_page_apps->len) return;
+    GPtrArray *apps = g_ptr_array_index(ui->fs_page_apps, page);
+    gint cols = MAX(1, ui->fs_page_cols), rows = ((gint)apps->len + cols - 1) / cols;
+    for (gint r = 0; r < rows; r++) {
+        gint idx = r * cols + (last_col ? cols - 1 : 0);
+        if (last_col && idx >= (gint)apps->len) idx = (gint)apps->len - 1;   /* short last row */
+        if (idx < 0 || idx >= (gint)apps->len) continue;
+        GdkPixbuf *pb = load_app_pixbuf_at_size(g_ptr_array_index(apps, idx), icon_px);
+        GtkWidget *img = pb ? gtk_image_new_from_pixbuf(pb) : gtk_image_new_from_icon_name("application-x-executable", GTK_ICON_SIZE_DIALOG);
+        if (pb) g_object_unref(pb);
+        gtk_widget_set_size_request(img, icon_px, icon_px + 30);
+        gtk_box_pack_start(GTK_BOX(col), img, FALSE, FALSE, 0);
+    }
+}
+
+static void gnome_update_peeks(StartMenuUI *ui) {
+    gnome_fill_peek(ui, ui->gnome_peek_prev, ui->fs_current_page - 1, TRUE);
+    gnome_fill_peek(ui, ui->gnome_peek_next, ui->fs_current_page + 1, FALSE);
+    if (ui->gnome_peek_prev) gtk_widget_show_all(ui->gnome_peek_prev);
+    if (ui->gnome_peek_next) gtk_widget_show_all(ui->gnome_peek_next);
+}
+
+/* ---- opening: the icons grow into place (GNOME's icon scale-in), with the Animations setting ---- */
+static gboolean gnome_intro_end(gpointer d) {
+    StartMenuUI *ui = d;
+    if (ui->popup_win) gtk_style_context_remove_class(gtk_widget_get_style_context(ui->popup_win), "fs-grid-intro");
+    return G_SOURCE_REMOVE;
+}
+static void gnome_play_intro(StartMenuUI *ui) {
+    if (!ui->popup_win || shell_anim_ms(300) <= 0) return;
+    gtk_style_context_add_class(gtk_widget_get_style_context(ui->popup_win), "fs-grid-intro");
+    g_timeout_add(40, gnome_intro_end, ui);     /* the transition back to normal size is the animation */
+}
+
+static const GtkTargetEntry g_app_target[] = { { "ULTIMATE_APP_ID", GTK_TARGET_SAME_APP, 0 } };
+
+/* ---- dragging an app to another page: hold it at the left / right edge (or on a peek) for a second
+   (GNOME: OVERSHOOT_THRESHOLD 20 px, OVERSHOOT_TIMEOUT 1000 ms) ---- */
+static guint g_edge_turn_id = 0;
+static gint  g_edge_turn_dir = 0;
+static gboolean edge_turn_fire(gpointer d) {
+    StartMenuUI *ui = d;
+    fs_go_to_page(ui, ui->fs_current_page + g_edge_turn_dir);
+    return G_SOURCE_CONTINUE;                    /* still held there: keep turning, one page a second */
+}
+static void edge_turn_stop(void) {
+    if (g_edge_turn_id) { g_source_remove(g_edge_turn_id); g_edge_turn_id = 0; }
+    g_edge_turn_dir = 0;
+}
+static gboolean in_widget_x(GtkWidget *area, GtkWidget *w, gint x) {
+    if (!GTK_IS_WIDGET(w) || !gtk_widget_get_visible(w)) return FALSE;
+    gint wx = 0, wy = 0;
+    if (!gtk_widget_translate_coordinates(w, area, 0, 0, &wx, &wy)) return FALSE;
+    return x >= wx && x < wx + gtk_widget_get_allocated_width(w);
+}
+static gboolean on_deck_drag_motion(GtkWidget *area, GdkDragContext *ctx, gint x, gint y, guint t, StartMenuUI *ui) {
+    gint w = gtk_widget_get_allocated_width(area);
+    gint dir = 0;
+    if (x < 20 || in_widget_x(area, ui->gnome_peek_prev, x)) dir = -1;
+    else if (x > w - 20 || in_widget_x(area, ui->gnome_peek_next, x)) dir = 1;
+    if (dir != g_edge_turn_dir) {
+        edge_turn_stop();
+        if (dir) { g_edge_turn_dir = dir; g_edge_turn_id = g_timeout_add(1000, edge_turn_fire, ui); }
+    }
+    gdk_drag_status(ctx, 0, t);                  /* nothing to drop here: workspaces take drops */
+    return TRUE;
+}
+static void on_deck_drag_leave(GtkWidget *area, GdkDragContext *ctx, guint t, gpointer d) { edge_turn_stop(); }
+static gboolean on_deck_drag_drop(GtkWidget *area, GdkDragContext *ctx, gint x, gint y, guint t, gpointer d) {
+    edge_turn_stop();
+    gtk_drag_finish(ctx, FALSE, FALSE, t);
+    return TRUE;
+}
+
+static void on_gnome_app_drag_get(GtkWidget *w, GdkDragContext *c, GtkSelectionData *sd, guint i, guint t, GAppInfo *app) {
+    const gchar *id = get_app_id_token(app);
+    if (id) gtk_selection_data_set(sd, gtk_selection_data_get_target(sd), 8, (const guchar *)id, strlen(id));
+}
+
+static void gnome_make_tile_draggable(GtkWidget *eb, GAppInfo *app) {
+    if (!GTK_IS_WIDGET(eb) || !app) return;
+    gtk_drag_source_set(eb, GDK_BUTTON1_MASK, g_app_target, 1, GDK_ACTION_COPY);
+    GIcon *gi = g_app_info_get_icon(app);
+    if (gi) gtk_drag_source_set_icon_gicon(eb, gi);
+    g_signal_connect(eb, "drag-data-get", G_CALLBACK(on_gnome_app_drag_get), app);
+    sm_drag_keep_open(eb);
+}
+
+/* workspace map heights follow the screen: others 6.5 %, the current one 8 % of its height */
+static gint gnome_ws_h(gboolean active) {
+    GdkMonitor *m = gdk_display_get_primary_monitor(gdk_display_get_default());
+    if (!m) m = gdk_display_get_monitor(gdk_display_get_default(), 0);
+    GdkRectangle g = { 0, 0, 1920, 1080 };
+    if (m) gdk_monitor_get_geometry(m, &g);
+    return MAX(40, (gint)(g.height * (active ? 0.080 : 0.065)));
+}
+#define GNOME_WS_H        gnome_ws_h(FALSE)
+#define GNOME_WS_ACTIVE_H gnome_ws_h(TRUE)
+
+static gboolean gnome_hold_release(gpointer d) {
+    StartMenuUI *ui = d;
+    g_object_set_data(G_OBJECT(ui->popup_win), "gnome-hold-id", NULL);
+    clear_context_menu_guard_idle(ui->popup_win);     /* back on top with focus, guard off */
+    return G_SOURCE_REMOVE;
+}
+
+/* xfdesktop's wallpaper for workspace n (first monitor that has one), scaled & cached */
+static GHashTable *g_ws_wall_cache = NULL;   /* "path@WxH" → GdkPixbuf */
+static GdkPixbuf *gnome_ws_wallpaper(gint n, gint w, gint h) {
+    XfconfChannel *ch = xfconf_channel_get("xfce4-desktop");
+    if (!ch) return NULL;
+    GHashTable *props = xfconf_channel_get_properties(ch, "/backdrop/screen0");
+    if (!props) return NULL;
+    gboolean single = FALSE; gint single_n = 0;
+    gchar *path = NULL;
+    GHashTableIter it; gpointer k, v;
+    /* single-workspace mode: every workspace shows that one */
+    g_hash_table_iter_init(&it, props);
+    while (g_hash_table_iter_next(&it, &k, &v)) {
+        if (g_str_has_suffix(k, "/single-workspace-mode") && G_VALUE_HOLDS_BOOLEAN((GValue *)v) && g_value_get_boolean(v)) single = TRUE;
+        if (g_str_has_suffix(k, "/single-workspace-number") && G_VALUE_HOLDS_INT((GValue *)v)) single_n = g_value_get_int(v);
+    }
+    gchar *want = g_strdup_printf("/workspace%d/last-image", single ? single_n : n);
+    gchar *best_key = NULL;
+    g_hash_table_iter_init(&it, props);
+    while (g_hash_table_iter_next(&it, &k, &v)) {
+        if (!g_str_has_suffix(k, want) || !G_VALUE_HOLDS_STRING((GValue *)v)) continue;
+        if (!best_key || g_strcmp0(k, best_key) < 0) { best_key = k; g_free(path); path = g_value_dup_string(v); }
+    }
+    g_free(want);
+    g_hash_table_destroy(props);
+    if (!path || !path[0]) { g_free(path); return NULL; }
+    if (!g_ws_wall_cache) g_ws_wall_cache = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_object_unref);
+    gchar *ck = g_strdup_printf("%s@%dx%d", path, w, h);
+    GdkPixbuf *pb = g_hash_table_lookup(g_ws_wall_cache, ck);
+    if (!pb) {
+        pb = gdk_pixbuf_new_from_file_at_scale(path, w * 2, h * 2, FALSE, NULL);   /* crisp on the scaled map */
+        if (pb) g_hash_table_insert(g_ws_wall_cache, g_strdup(ck), pb);
+    }
+    g_free(ck); g_free(path);
+    return pb;
+}
+
+/* a small map of the workspace: its windows as frames with their icons */
+static gboolean on_gnome_ws_draw(GtkWidget *da, cairo_t *cr, StartMenuUI *ui) {
+    WnckWorkspace *ws = g_object_get_data(G_OBJECT(da), "wnck-ws");
+    WnckScreen *scr = (ui->shell && ui->shell->tracker) ? ui->shell->tracker->screen : NULL;
+    if (!WNCK_IS_WORKSPACE(ws) || !scr) return FALSE;
+    gint w = gtk_widget_get_allocated_width(da), h = gtk_widget_get_allocated_height(da);
+    ShellPalette p; shell_palette_get(ui->shell, &p);
+    gboolean active = (ws == wnck_screen_get_active_workspace(scr));
+    gboolean hover = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(da), "drop-hover"));
+
+    gdouble r = CLAMP(h * 0.11, 6.0, 12.0);     /* GNOME's 30 px wallpaper radius, scaled to the map */
+    cairo_save(cr);
+    cairo_new_sub_path(cr);
+    cairo_arc(cr, w - r - 1, r + 1, r, -G_PI / 2, 0);
+    cairo_arc(cr, w - r - 1, h - r - 1, r, 0, G_PI / 2);
+    cairo_arc(cr, r + 1, h - r - 1, r, G_PI / 2, G_PI);
+    cairo_arc(cr, r + 1, r + 1, r, G_PI, 3 * G_PI / 2);
+    cairo_close_path(cr);
+    GdkPixbuf *wall = g_object_get_data(G_OBJECT(da), "ws-wall");   /* looked up once per opening */
+    cairo_clip(cr);                  /* rounded map; clears the path for the window frames */
+    if (wall) {
+        cairo_save(cr);
+        cairo_scale(cr, (gdouble)w / gdk_pixbuf_get_width(wall), (gdouble)h / gdk_pixbuf_get_height(wall));
+        gdk_cairo_set_source_pixbuf(cr, wall, 0, 0);
+        cairo_paint(cr);
+        cairo_restore(cr);
+    } else {
+        cairo_set_source_rgba(cr, p.fg.red, p.fg.green, p.fg.blue, 0.10);
+        cairo_paint(cr);
+    }
+    if (hover) { cairo_set_source_rgba(cr, p.accent.red, p.accent.green, p.accent.blue, 0.25); cairo_paint(cr); }
+
+    gint sw = wnck_screen_get_width(scr), sh = wnck_screen_get_height(scr);
+    gdouble sx = (gdouble)w / MAX(1, sw), sy = (gdouble)h / MAX(1, sh);
+    GList *wins = g_list_copy(wnck_screen_get_windows_stacked(scr));   /* bottom → top */
+    for (GList *l = wins; l; l = l->next) {
+        WnckWindow *win = l->data;
+        if (wnck_window_is_skip_tasklist(win) || wnck_window_is_minimized(win) ||
+            wnck_window_get_window_type(win) != WNCK_WINDOW_NORMAL || !wnck_window_is_on_workspace(win, ws)) continue;
+        gint x, y, ww, wh;
+        wnck_window_get_geometry(win, &x, &y, &ww, &wh);
+        x -= wnck_workspace_get_viewport_x(ws); y -= wnck_workspace_get_viewport_y(ws);
+        gdouble rx = x * sx, ry = y * sy, rw = MAX(6, ww * sx), rh = MAX(6, wh * sy);
+        cairo_rectangle(cr, rx + 0.5, ry + 0.5, rw - 1, rh - 1);
+        cairo_set_source_rgba(cr, p.bg.red, p.bg.green, p.bg.blue, 0.95);
+        cairo_fill_preserve(cr);
+        cairo_set_source_rgba(cr, p.fg.red, p.fg.green, p.fg.blue, 0.30);
+        cairo_set_line_width(cr, 1);
+        cairo_stroke(cr);
+        GdkPixbuf *ic = wnck_window_get_mini_icon(win);
+        if (ic && rw > 18 && rh > 18) {
+            gdk_cairo_set_source_pixbuf(cr, ic, rx + (rw - gdk_pixbuf_get_width(ic)) / 2, ry + (rh - gdk_pixbuf_get_height(ic)) / 2);
+            cairo_paint(cr);
+        }
+    }
+    g_list_free(wins);
+    cairo_restore(cr);
+    /* frame: accent on the current workspace / while an app hovers over it */
+    cairo_new_sub_path(cr);
+    cairo_arc(cr, w - r - 1, r + 1, r, -G_PI / 2, 0);
+    cairo_arc(cr, w - r - 1, h - r - 1, r, 0, G_PI / 2);
+    cairo_arc(cr, r + 1, h - r - 1, r, G_PI / 2, G_PI);
+    cairo_arc(cr, r + 1, r + 1, r, G_PI, 3 * G_PI / 2);
+    cairo_close_path(cr);
+    if (active || hover) cairo_set_source_rgba(cr, p.accent.red, p.accent.green, p.accent.blue, 1.0);
+    else cairo_set_source_rgba(cr, p.fg.red, p.fg.green, p.fg.blue, 0.25);
+    cairo_set_line_width(cr, (active || hover) ? 2.5 : 1.0);
+    cairo_stroke(cr);
+    return FALSE;
+}
+
+static gboolean on_gnome_ws_press(GtkWidget *da, GdkEventButton *ev, StartMenuUI *ui) {
+    if (ev->type != GDK_BUTTON_PRESS || ev->button != 1) return TRUE;
+    /* switch to that workspace; the grid stays open (it is sticky) */
+    WnckWorkspace *ws = g_object_get_data(G_OBJECT(da), "wnck-ws");
+    WnckScreen *scr = (ui->shell && ui->shell->tracker) ? ui->shell->tracker->screen : NULL;
+    if (WNCK_IS_WORKSPACE(ws) && scr && ws != wnck_screen_get_active_workspace(scr)) {
+        gnome_hold_open(ui, 700);
+        wnck_workspace_activate(ws, ev->time);
+    }
+    return TRUE;
+}
+
+static gboolean on_gnome_ws_drag_motion(GtkWidget *da, GdkDragContext *c, gint x, gint y, guint t, gpointer d) {
+    if (!GPOINTER_TO_INT(g_object_get_data(G_OBJECT(da), "drop-hover"))) {
+        g_object_set_data(G_OBJECT(da), "drop-hover", GINT_TO_POINTER(1));
+        gtk_widget_queue_draw(da);
+    }
+    gdk_drag_status(c, GDK_ACTION_COPY, t);
+    return TRUE;
+}
+static void on_gnome_ws_drag_leave(GtkWidget *da, GdkDragContext *c, guint t, gpointer d) {
+    g_object_set_data(G_OBJECT(da), "drop-hover", NULL);
+    gtk_widget_queue_draw(da);
+}
+
+/* Keep the grid open for a moment although focus moves (workspace switch, a new window):
+   the focus-out close is skipped, then the grid takes focus back */
+static void gnome_hold_open(StartMenuUI *ui, guint ms) {
+    if (!ui || !ui->popup_win) return;
+    g_object_set_data(G_OBJECT(ui->popup_win), "context-menu-open", GINT_TO_POINTER(1));
+    guint old = GPOINTER_TO_UINT(g_object_get_data(G_OBJECT(ui->popup_win), "gnome-hold-id"));
+    if (old) g_source_remove(old);
+    guint id = g_timeout_add(ms, gnome_hold_release, ui);
+    g_object_set_data(G_OBJECT(ui->popup_win), "gnome-hold-id", GUINT_TO_POINTER(id));
+}
+
+typedef struct { GAppInfo *app; } GnomeLaunchLater;
+static gboolean gnome_launch_later(gpointer data) {
+    GnomeLaunchLater *l = data;
+    if (l->app) { usage_record_launch(l->app); shell_launch_app_info(l->app); }
+    g_object_unref(l->app);
+    g_free(l);
+    return G_SOURCE_REMOVE;
+}
+
+/* app dropped on a workspace: go there, then start the app (it opens on that workspace) */
+static void on_gnome_ws_drag_received(GtkWidget *da, GdkDragContext *c, gint x, gint y, GtkSelectionData *sd,
+                                      guint info, guint t, StartMenuUI *ui) {
+    const guchar *data = gtk_selection_data_get_data(sd);
+    gint len = gtk_selection_data_get_length(sd);
+    GAppInfo *hit = NULL;
+    if (data && len > 0) {
+        gchar *id = g_strndup((const gchar *)data, len);
+        for (GList *l = get_sorted_apps_cached(ui); l; l = l->next)
+            if (g_strcmp0(get_app_id_token(l->data), id) == 0) { hit = l->data; break; }
+        g_free(id);
+    }
+    if (!hit) return;              /* GTK_DEST_DEFAULT_DROP finishes the drag itself */
+    WnckWorkspace *ws = g_object_get_data(G_OBJECT(da), "wnck-ws");
+    /* the grid stays open: switch, start the app and watch it appear in the overview */
+    gnome_hold_open(ui, 3000);
+    if (WNCK_IS_WORKSPACE(ws)) wnck_workspace_activate(ws, t);
+    GnomeLaunchLater *l = g_new0(GnomeLaunchLater, 1);
+    l->app = g_object_ref(hit);
+    g_timeout_add(150, gnome_launch_later, l);    /* let the workspace switch land first */
+}
+
+static gboolean on_gnome_strip_scroll(GtkWidget *w, GdkEventScroll *ev, StartMenuUI *ui) {
+    WnckScreen *scr = (ui->shell && ui->shell->tracker) ? ui->shell->tracker->screen : NULL;
+    if (!scr) return TRUE;
+    static gint64 last_us = 0;
+    static gdouble acc = 0;
+    gint dir = 0;
+    if (ev->direction == GDK_SCROLL_UP || ev->direction == GDK_SCROLL_LEFT) dir = -1;
+    else if (ev->direction == GDK_SCROLL_DOWN || ev->direction == GDK_SCROLL_RIGHT) dir = 1;
+    else if (ev->direction == GDK_SCROLL_SMOOTH) {
+        acc += (fabs(ev->delta_x) > fabs(ev->delta_y)) ? ev->delta_x : ev->delta_y;
+        if (acc <= -1.0) { dir = -1; acc = 0; } else if (acc >= 1.0) { dir = 1; acc = 0; }
+    }
+    gint64 now = g_get_monotonic_time();
+    if (!dir || now - last_us < 220000) return TRUE;   /* one workspace per notch */
+    last_us = now;
+    WnckWorkspace *cur = wnck_screen_get_active_workspace(scr);
+    gint n = cur ? wnck_workspace_get_number(cur) : 0;
+    WnckWorkspace *next = wnck_screen_get_workspace(scr, CLAMP(n + dir, 0, wnck_screen_get_workspace_count(scr) - 1));
+    if (next && next != cur) {
+        gnome_hold_open(ui, 700);
+        wnck_workspace_activate(next, ev->time);
+    }
+    return TRUE;
+}
+
+/* the overview follows the desktop while the grid is open */
+static guint g_gnome_refresh_id = 0;
+static gboolean gnome_refresh_idle(gpointer d) {
+    g_gnome_refresh_id = 0;
+    StartMenuUI *ui = d;
+    if (ui->popup_win && gtk_widget_get_visible(ui->popup_win) && ui->shell &&
+        ui->shell->start_style == START_STYLE_GNOME) gnome_overview_refresh(ui);
+    return G_SOURCE_REMOVE;
+}
+static void gnome_queue_refresh(StartMenuUI *ui, guint ms) {
+    if (g_gnome_refresh_id) g_source_remove(g_gnome_refresh_id);
+    g_gnome_refresh_id = g_timeout_add(ms, gnome_refresh_idle, ui);
+}
+static void on_gnome_screen_changed(WnckScreen *scr, gpointer arg, StartMenuUI *ui) { gnome_queue_refresh(ui, 60); }
+static void on_gnome_window_opened(WnckScreen *scr, WnckWindow *w, StartMenuUI *ui) {
+    gnome_queue_refresh(ui, 60);
+    gnome_queue_refresh(ui, 600);      /* again once it has its size and place */
+}
+
+/* the maps grow / shrink to their new size in 200 ms (GNOME's RESCALE_ANIMATION_TIME) */
+typedef struct { StartMenuUI *ui; gint sw, sh; gint64 t0, dur; } GnomeWsAnim;
+static guint g_gnome_ws_anim_id = 0;
+static gboolean gnome_ws_resize_tick(gpointer d) {
+    GnomeWsAnim *a = d;
+    gdouble t = MIN(1.0, (gdouble)(g_get_monotonic_time() - a->t0) / MAX(1, a->dur));
+    gdouble e = 1.0 - pow(1.0 - t, 3.0);
+    if (GTK_IS_BOX(a->ui->gnome_overview)) {
+        GList *kids = gtk_container_get_children(GTK_CONTAINER(a->ui->gnome_overview));
+        for (GList *l = kids; l; l = l->next) {
+            gint f = GPOINTER_TO_INT(g_object_get_data(l->data, "ws-from-h"));
+            gint to = GPOINTER_TO_INT(g_object_get_data(l->data, "ws-to-h"));
+            if (!to) continue;
+            gint h = (gint)lround(f + (to - f) * e);
+            gtk_widget_set_size_request(l->data, h * MAX(1, a->sw) / MAX(1, a->sh), h);
+        }
+        g_list_free(kids);
+    }
+    if (t >= 1.0) { g_gnome_ws_anim_id = 0; return G_SOURCE_REMOVE; }
+    return G_SOURCE_CONTINUE;
+}
+static void gnome_ws_resize_start(StartMenuUI *ui, gint sw, gint sh) {
+    if (g_gnome_ws_anim_id) g_source_remove(g_gnome_ws_anim_id);
+    GnomeWsAnim *a = g_new0(GnomeWsAnim, 1);
+    a->ui = ui; a->sw = sw; a->sh = sh;
+    a->t0 = g_get_monotonic_time();
+    a->dur = (gint64)shell_anim_ms(200) * 1000;
+    g_gnome_ws_anim_id = g_timeout_add_full(G_PRIORITY_DEFAULT, 15, gnome_ws_resize_tick, a, g_free);
+}
+
+/* Rebuilt every time the grid opens: one small map per workspace */
+static void gnome_overview_refresh(StartMenuUI *ui) {
+    if (!GTK_IS_BOX(ui->gnome_overview)) return;
+    GList *kids = gtk_container_get_children(GTK_CONTAINER(ui->gnome_overview));
+    for (GList *l = kids; l; l = l->next) gtk_widget_destroy(GTK_WIDGET(l->data));
+    g_list_free(kids);
+
+    WnckScreen *scr = (ui->shell && ui->shell->tracker) ? ui->shell->tracker->screen : NULL;
+    if (!scr) return;
+    if (!g_object_get_data(G_OBJECT(scr), "ult-gnome-hooked")) {
+        g_signal_connect(scr, "window-opened", G_CALLBACK(on_gnome_window_opened), ui);
+        g_signal_connect(scr, "window-closed", G_CALLBACK(on_gnome_screen_changed), ui);
+        g_signal_connect(scr, "active-workspace-changed", G_CALLBACK(on_gnome_screen_changed), ui);
+        g_signal_connect(scr, "workspace-created", G_CALLBACK(on_gnome_screen_changed), ui);
+        g_signal_connect(scr, "workspace-destroyed", G_CALLBACK(on_gnome_screen_changed), ui);
+        g_object_set_data(G_OBJECT(scr), "ult-gnome-hooked", GINT_TO_POINTER(1));
+    }
+    gint sw = wnck_screen_get_width(scr), sh = wnck_screen_get_height(scr);
+    WnckWorkspace *cur = wnck_screen_get_active_workspace(scr);
+    static WnckWorkspace *prev_active = NULL;
+    gboolean animate = (prev_active && prev_active != cur && shell_anim_ms(200) > 0);
+    for (GList *l = wnck_screen_get_workspaces(scr); l; l = l->next) {
+        WnckWorkspace *ws = l->data;
+        gint th = (ws == cur) ? GNOME_WS_ACTIVE_H : GNOME_WS_H;
+        gint from = animate ? ((ws == prev_active) ? GNOME_WS_ACTIVE_H : GNOME_WS_H) : th;
+        GtkWidget *da = gtk_drawing_area_new();
+        gtk_widget_set_size_request(da, from * MAX(1, sw) / MAX(1, sh), from);
+        g_object_set_data(G_OBJECT(da), "ws-from-h", GINT_TO_POINTER(from));
+        g_object_set_data(G_OBJECT(da), "ws-to-h", GINT_TO_POINTER(th));
+        gtk_widget_set_valign(da, GTK_ALIGN_CENTER);
+        g_object_set_data(G_OBJECT(da), "ws-wall",
+                          gnome_ws_wallpaper(wnck_workspace_get_number(ws), th * MAX(1, sw) / MAX(1, sh), th));   /* owned by the cache */
+        gtk_widget_set_tooltip_text(da, wnck_workspace_get_name(ws));
+        g_object_set_data(G_OBJECT(da), "wnck-ws", ws);
+        gtk_widget_add_events(da, GDK_BUTTON_PRESS_MASK);
+        g_signal_connect(da, "draw", G_CALLBACK(on_gnome_ws_draw), ui);
+        g_signal_connect(da, "button-press-event", G_CALLBACK(on_gnome_ws_press), ui);
+        gtk_drag_dest_set(da, GTK_DEST_DEFAULT_DROP, g_app_target, 1, GDK_ACTION_COPY);
+        g_signal_connect(da, "drag-motion", G_CALLBACK(on_gnome_ws_drag_motion), NULL);
+        g_signal_connect(da, "drag-leave", G_CALLBACK(on_gnome_ws_drag_leave), NULL);
+        g_signal_connect(da, "drag-data-received", G_CALLBACK(on_gnome_ws_drag_received), ui);
+        gtk_box_pack_start(GTK_BOX(ui->gnome_overview), da, FALSE, FALSE, 0);
+    }
+    prev_active = cur;
+    gtk_widget_show_all(ui->gnome_overview);
+    if (animate) gnome_ws_resize_start(ui, sw, sh);
+}
+
+static void on_start_popup_show(GtkWidget *win, StartMenuUI *ui) {
+    if (ui && ui->shell && ui->shell->start_style == START_STYLE_GNOME) gnome_overview_refresh(ui);
+    if (ui && sm_style_fullscreen(ui->shell)) gnome_play_intro(ui);    /* Launchpad + GNOME: icons grow in */
 }
 
 void start_menu_rebuild_style(UltimateShell *shell) {
@@ -2744,6 +4349,13 @@ void start_menu_rebuild_style(UltimateShell *shell) {
     ui->fs_cat_scroll = NULL;
     ui->search_extras = ui->calc_row = ui->calc_lbl = ui->web_btn = NULL;
     ui->rec_widget = NULL;
+    ui->win10_tiles_grid = ui->win10_tiles_pane = ui->win10_list_stack = ui->win10_list_scroll = NULL;
+    ui->gnome_overview = ui->gnome_overview_scroll = NULL;
+    ui->gnome_peek_prev = ui->gnome_peek_next = NULL;
+    if (!g_object_get_data(G_OBJECT(ui->popup_win), "show-hooked")) {
+        g_signal_connect(ui->popup_win, "show", G_CALLBACK(on_start_popup_show), ui);
+        g_object_set_data(G_OBJECT(ui->popup_win), "show-hooked", GINT_TO_POINTER(1));
+    }
     ui->rebuild_pending = FALSE;
     g_free(ui->active_category);
     ui->active_category = g_strdup("All");
@@ -2762,19 +4374,28 @@ void start_menu_rebuild_style(UltimateShell *shell) {
     gint st = get_active_style_idx(shell);
     gint cat_icon_px = (shell->start_style_cat_icon[st] > 0) ? CLAMP(shell->start_style_cat_icon[st], 16, 32) : 18;
     gint win11_cols  = (shell->start_style_grid_cols[START_STYLE_WIN11] > 0) ? CLAMP(shell->start_style_grid_cols[START_STYLE_WIN11], 3, 8) : 6;
-    gint fs_cols     = (shell->start_style_grid_cols[START_STYLE_FULLSCREEN] > 0) ? CLAMP(shell->start_style_grid_cols[START_STYLE_FULLSCREEN], 4, 10) : 7;
+    gint fs_st       = (style == START_STYLE_GNOME) ? START_STYLE_GNOME : START_STYLE_FULLSCREEN;
+    gint fs_cols     = (shell->start_style_grid_cols[fs_st] > 0) ? CLAMP(shell->start_style_grid_cols[fs_st], 4, 10) : 7;
+    gboolean is_gnome = (style == START_STYLE_GNOME);
     gboolean show_user = shell->start_show_user_header;
     StartCatDisplayMode cat_mode = shell->start_style_cat_mode[st];
 
     g_object_set_data(G_OBJECT(ui->popup_win), "is-fullscreen-start",
-                      GINT_TO_POINTER(style == START_STYLE_FULLSCREEN ? 1 : 0));
-    if (style == START_STYLE_FULLSCREEN) {
+                      GINT_TO_POINTER(sm_style_fullscreen(shell) ? 1 : 0));
+    if (sm_style_fullscreen(shell)) {
         gtk_style_context_add_class(gtk_widget_get_style_context(ui->popup_win), "fullscreen-launchpad");
     } else {
         gtk_style_context_remove_class(gtk_widget_get_style_context(ui->popup_win), "fullscreen-launchpad");
     }
+    if (is_gnome) gtk_style_context_add_class(gtk_widget_get_style_context(ui->popup_win), "gnome-app-grid");
+    else gtk_style_context_remove_class(gtk_widget_get_style_context(ui->popup_win), "gnome-app-grid");
+    g_object_set_data(G_OBJECT(ui->popup_win), "close-class", sm_style_fullscreen(shell) ? (gpointer)"fs-grid-outro" : NULL);
+    if (is_gnome) gtk_window_stick(GTK_WINDOW(ui->popup_win));      /* stays up while switching workspaces */
+    else gtk_window_unstick(GTK_WINDOW(ui->popup_win));
 
-    if (style == START_STYLE_FULLSCREEN) {
+    if (style == START_STYLE_WIN10) {
+        build_win10_menu(ui);
+    } else if (sm_style_fullscreen(shell)) {
         GdkRectangle fs_rect;
         compute_fullscreen_menu_workarea(ui, &fs_rect);
         gtk_window_set_resizable(GTK_WINDOW(ui->popup_win), FALSE);
@@ -2782,7 +4403,8 @@ void start_menu_rebuild_style(UltimateShell *shell) {
         gtk_window_resize(GTK_WINDOW(ui->popup_win), fs_rect.width, fs_rect.height);
         gtk_container_set_border_width(GTK_CONTAINER(ui->root_container), 16);
 
-        gboolean search_top = should_place_search_top(shell, TRUE);
+        gboolean search_top = is_gnome ? TRUE : should_place_search_top(shell, TRUE);
+        if (is_gnome) gtk_entry_set_placeholder_text(GTK_ENTRY(ui->search_entry), "Type to search");
 
         GtkWidget *search_center_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
         gtk_widget_set_size_request(ui->search_entry, 420, 34);
@@ -2814,14 +4436,21 @@ void start_menu_rebuild_style(UltimateShell *shell) {
         gtk_box_pack_start(GTK_BOX(cat_outer_bar), cat_right_btn, FALSE, FALSE, 0);
 
         ui->fs_page_stack = gtk_stack_new();
-        gtk_stack_set_transition_duration(GTK_STACK(ui->fs_page_stack), 220);
-        build_fullscreen_paged_deck(ui, cat_box, &fs_rect);
+        gtk_stack_set_transition_duration(GTK_STACK(ui->fs_page_stack),
+                                          (guint)shell_anim_ms(250));   /* GNOME's PAGE_SWITCH_TIME, for Launchpad too */
+        build_fullscreen_paged_deck(ui, cat_box, &fs_rect, is_gnome, is_gnome ? 130 : 0);
 
         GtkWidget *deck_eb = gtk_event_box_new();
         gtk_event_box_set_visible_window(GTK_EVENT_BOX(deck_eb), FALSE);
         gtk_widget_add_events(deck_eb, GDK_SCROLL_MASK | GDK_SMOOTH_SCROLL_MASK | GDK_BUTTON_PRESS_MASK);
         g_signal_connect(deck_eb, "scroll-event", G_CALLBACK(on_fs_deck_scroll), ui);
         g_signal_connect(deck_eb, "button-press-event", G_CALLBACK(on_fs_background_button_press), ui);
+        if (is_gnome) {   /* hold a dragged app at a side to turn the page */
+            gtk_drag_dest_set(deck_eb, 0, g_app_target, 1, GDK_ACTION_COPY);
+            g_signal_connect(deck_eb, "drag-motion", G_CALLBACK(on_deck_drag_motion), ui);
+            g_signal_connect(deck_eb, "drag-leave", G_CALLBACK(on_deck_drag_leave), NULL);
+            g_signal_connect(deck_eb, "drag-drop", G_CALLBACK(on_deck_drag_drop), NULL);
+        }
 
         GtkWidget *deck_nav_hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
         GtkWidget *prev_page_btn = gtk_button_new_from_icon_name("go-previous-symbolic", GTK_ICON_SIZE_LARGE_TOOLBAR);
@@ -2835,9 +4464,19 @@ void start_menu_rebuild_style(UltimateShell *shell) {
         g_signal_connect(prev_page_btn, "clicked", G_CALLBACK(on_fs_prev_page_clicked), ui);
         g_signal_connect(next_page_btn, "clicked", G_CALLBACK(on_fs_next_page_clicked), ui);
 
-        gtk_box_pack_start(GTK_BOX(deck_nav_hbox), prev_page_btn, FALSE, FALSE, 4);
+        if (!is_gnome) gtk_box_pack_start(GTK_BOX(deck_nav_hbox), prev_page_btn, FALSE, FALSE, 4);
+        if (is_gnome) {   /* the neighbouring pages peek in at the sides (click one to go there) */
+            ui->gnome_peek_prev = gnome_make_peek(ui, -1);
+            gtk_box_pack_start(GTK_BOX(deck_nav_hbox), ui->gnome_peek_prev, FALSE, FALSE, 0);
+        }
         gtk_box_pack_start(GTK_BOX(deck_nav_hbox), ui->fs_page_stack, TRUE, TRUE, 0);
-        gtk_box_pack_end(GTK_BOX(deck_nav_hbox), next_page_btn, FALSE, FALSE, 4);
+        if (!is_gnome) gtk_box_pack_end(GTK_BOX(deck_nav_hbox), next_page_btn, FALSE, FALSE, 4);
+        else {
+            gtk_widget_destroy(prev_page_btn); gtk_widget_destroy(next_page_btn);   /* GNOME: no arrows */
+            ui->gnome_peek_next = gnome_make_peek(ui, 1);
+            gtk_box_pack_end(GTK_BOX(deck_nav_hbox), ui->gnome_peek_next, FALSE, FALSE, 0);
+            gnome_update_peeks(ui);
+        }
         gtk_container_add(GTK_CONTAINER(deck_eb), deck_nav_hbox);
 
         GtkWidget *search_scroll = gtk_scrolled_window_new(NULL, NULL);
@@ -2877,8 +4516,25 @@ void start_menu_rebuild_style(UltimateShell *shell) {
         if (search_top) {
             gtk_box_pack_start(GTK_BOX(ui->root_container), search_center_box, FALSE, FALSE, 0);
         }
+        if (is_gnome) {
+            /* open windows of this workspace, like the Activities overview */
+            ui->gnome_overview_scroll = gtk_scrolled_window_new(NULL, NULL);
+            gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(ui->gnome_overview_scroll), GTK_POLICY_AUTOMATIC, GTK_POLICY_NEVER);
+            gtk_scrolled_window_set_propagate_natural_width(GTK_SCROLLED_WINDOW(ui->gnome_overview_scroll), TRUE);
+            gtk_widget_set_halign(ui->gnome_overview_scroll, GTK_ALIGN_CENTER);
+            ui->gnome_overview = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+            gtk_widget_set_halign(ui->gnome_overview, GTK_ALIGN_CENTER);
+            gtk_container_add(GTK_CONTAINER(ui->gnome_overview_scroll), ui->gnome_overview);
+            gtk_widget_set_size_request(ui->gnome_overview_scroll, -1, gnome_ws_h(TRUE) + 8);   /* fixed: the grid stays put */
+            gtk_widget_add_events(ui->gnome_overview_scroll, GDK_SCROLL_MASK | GDK_SMOOTH_SCROLL_MASK);
+            g_signal_connect(ui->gnome_overview_scroll, "scroll-event", G_CALLBACK(on_gnome_strip_scroll), ui);
+            gtk_box_pack_start(GTK_BOX(ui->root_container), ui->gnome_overview_scroll, FALSE, FALSE, 6);
+            gnome_overview_refresh(ui);
+        }
+        /* GNOME has no category bar: kept (the page logic uses its buttons) but never shown */
         gtk_box_pack_start(GTK_BOX(ui->root_container), cat_outer_bar, FALSE, FALSE, 0);
-        ui->rec_widget = build_recommended_section(ui, 4);
+        if (is_gnome) gtk_widget_set_no_show_all(cat_outer_bar, TRUE);
+        ui->rec_widget = is_gnome ? NULL : build_recommended_section(ui, 4);
         if (ui->rec_widget) {
             gtk_widget_set_halign(ui->rec_widget, GTK_ALIGN_CENTER);
             gtk_widget_set_size_request(ui->rec_widget, MIN(fs_rect.width - 200, 900), -1);
@@ -2951,6 +4607,9 @@ void start_menu_rebuild_style(UltimateShell *shell) {
         g_signal_connect(ui->flow_box, "child-activated", G_CALLBACK(on_flow_child_activated), ui);
         populate_win11_grid(ui, ui->flow_box, TRUE);
         g_object_set_data(G_OBJECT(ui->popup_win), "win11-pinned-flow", ui->flow_box);
+        g_object_set_data(G_OBJECT(ui->flow_box), "fav-order", GINT_TO_POINTER(1));
+        ensure_search_sort(ui, ui->flow_box);
+        fav_area_setup(ui, ui->flow_box);
         gtk_container_add(GTK_CONTAINER(scroll_grid), ui->flow_box);
 
         GtkWidget *scroll_list = gtk_scrolled_window_new(NULL, NULL);
@@ -3111,7 +4770,7 @@ void start_menu_rebuild_style(UltimateShell *shell) {
         if (!search_top) {
             gtk_box_pack_start(GTK_BOX(bottom_row), ui->search_entry, TRUE, TRUE, 0);
         }
-        gtk_box_pack_end(GTK_BOX(bottom_row), create_action_buttons_box(ui, TRUE), FALSE, FALSE, 0);
+        gtk_box_pack_end(GTK_BOX(bottom_row), classic_power_button(ui), FALSE, FALSE, 0);   /* like Windows 7 */
 
         if (search_top) {
             gtk_box_pack_start(GTK_BOX(ui->root_container), ui->search_entry, FALSE, FALSE, 0);
@@ -3216,6 +4875,18 @@ void start_menu_rebuild_style(UltimateShell *shell) {
             g_signal_connect(ui->flow_box, "child-activated", G_CALLBACK(on_flow_child_activated), ui);
             populate_win11_grid(ui, ui->flow_box, FALSE);
             gtk_container_add(GTK_CONTAINER(scroll), ui->flow_box);
+            g_object_set_data(G_OBJECT(ui->flow_box), "fav-order-cat", GINT_TO_POINTER(1));
+            ensure_search_sort(ui, ui->flow_box);
+            fav_area_setup(ui, ui->flow_box);
+            {
+                GList *kids = gtk_container_get_children(GTK_CONTAINER(ui->flow_box));
+                for (GList *l = kids; l; l = l->next) {
+                    GAppInfo *ka = g_object_get_data(G_OBJECT(l->data), "app-info");
+                    if (ka && is_app_in_favorites(shell, ka))
+                        fav_source_setup(gtk_bin_get_child(GTK_BIN(l->data)), ka, ui->flow_box);
+                }
+                g_list_free(kids);
+            }
             GtkWidget *rec = build_recommended_section(ui, 2);
             if (rec) {
                 right_pane = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
@@ -3230,6 +4901,19 @@ void start_menu_rebuild_style(UltimateShell *shell) {
             g_signal_connect(ui->list_box, "row-activated", G_CALLBACK(on_app_row_activated), ui);
             populate_app_list(ui, ui->list_box, FALSE);
             gtk_container_add(GTK_CONTAINER(scroll), ui->list_box);
+            /* Favourites: your order, drag a row to move it (with a live preview) */
+            g_object_set_data(G_OBJECT(ui->list_box), "fav-order-cat", GINT_TO_POINTER(1));
+            ensure_search_sort(ui, ui->list_box);
+            fav_area_setup(ui, ui->list_box);
+            {
+                GList *rows = gtk_container_get_children(GTK_CONTAINER(ui->list_box));
+                for (GList *l = rows; l; l = l->next) {
+                    GAppInfo *ra = g_object_get_data(G_OBJECT(l->data), "app-info");
+                    if (ra && is_app_in_favorites(shell, ra))
+                        fav_source_setup(gtk_bin_get_child(GTK_BIN(l->data)), ra, ui->list_box);
+                }
+                g_list_free(rows);
+            }
         }
 
         gtk_box_pack_start(GTK_BOX(columns), cat_scroll, FALSE, FALSE, 0);
@@ -3281,7 +4965,7 @@ void start_menu_rebuild_style(UltimateShell *shell) {
         gtk_box_pack_start(GTK_BOX(ui->root_container), bottom_bar, FALSE, FALSE, 0);
     }
 
-    if (shell->start_style == START_STYLE_FULLSCREEN) {
+    if (sm_style_fullscreen(shell)) {
         gtk_container_add(GTK_CONTAINER(ui->popup_win), ui->root_container);   /* fills the screen: no edges */
     } else {
         gtk_container_add(GTK_CONTAINER(ui->popup_win), wrap_with_edge_handles(ui, ui->root_container));
@@ -3295,10 +4979,44 @@ void start_menu_rebuild_style(UltimateShell *shell) {
                 ".start-rec-item { padding: 6px 8px; border-radius: 8px; }"
                 ".start-rec-sub { font-size: smaller; }"
                 ".start-search-extras { padding: 2px 6px; }"
+                ".win10-tile { background-color: alpha(@theme_fg_color, 0.10); border: 1px solid transparent; }"
+                ".win10-tile:hover { background-color: alpha(@theme_fg_color, 0.20); border-color: alpha(@theme_fg_color, 0.60); }"
+                ".win10-tile:active { background-color: alpha(@theme_fg_color, 0.08); }"
+                ".win10-tile-label { color: @theme_fg_color; font-size: smaller; }"
+                ".win10-rail { background-color: alpha(@theme_fg_color, 0.05); border-radius: 6px; }"
+                ".win10-rail-btn { min-width: 0; padding: 4px; border-radius: 4px; }"
+                ".win10-letter { font-size: large; font-weight: bold; border-radius: 4px; }"
+                ".win10-group-hdr { padding: 2px 4px; border-radius: 4px; }"
+                /* keyboard focus: the selected app is clearly marked in every style */
+                ".ultimate-popup-win list row:focus, .ultimate-popup-win list row.app-grid-tile:focus {"
+                "  background-color: alpha(@theme_selected_bg_color, 0.30); border-color: @theme_selected_bg_color; }"
+                ".ultimate-popup-win flowboxchild:focus .app-grid-tile {"
+                "  background-color: alpha(@theme_selected_bg_color, 0.30); border-color: @theme_selected_bg_color; }"
+                /* GNOME App Grid opening: icons start a bit small and faint, then settle in */
+                ".fullscreen-launchpad .app-grid-tile image { transition: -gtk-icon-transform 300ms ease-out, opacity 300ms ease-out; }"
+                ".fullscreen-launchpad .app-grid-tile label { transition: opacity 300ms ease-out; }"
+                ".fullscreen-launchpad.fs-grid-intro .app-grid-tile image { -gtk-icon-transform: scale(0.80); opacity: 0; }"
+                ".fullscreen-launchpad.fs-grid-intro .app-grid-tile label { opacity: 0; }"
+                /* closing: the reverse, while the screen fades out */
+                ".fullscreen-launchpad.fs-grid-outro .app-grid-tile image { -gtk-icon-transform: scale(0.88); opacity: 0;"
+                "  transition: -gtk-icon-transform 160ms ease-in, opacity 160ms ease-in; }"
+                ".fullscreen-launchpad.fs-grid-outro .app-grid-tile label { opacity: 0; transition: opacity 160ms ease-in; }"
+
                 ".start-new-badge { font-size: smaller; font-weight: bold; padding: 1px 7px; border-radius: 99px;"
                 "  color: @theme_selected_fg_color; background-color: @theme_selected_bg_color; }", -1, NULL);
             gtk_style_context_add_provider_for_screen(gdk_screen_get_default(), GTK_STYLE_PROVIDER(smcss),
                                                       GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+        }
+    }
+    {   /* GNOME App Grid: square full-screen sheet (above the shell's corner-radius setting) */
+        static GtkCssProvider *gcss = NULL;
+        if (!gcss) {
+            gcss = gtk_css_provider_new();
+            gtk_css_provider_load_from_data(gcss,
+                ".ultimate-popup-win.gnome-app-grid, window.ultimate-popup-win.gnome-app-grid.background,"
+                " .gnome-app-grid decoration { border-radius: 0; border: none; box-shadow: none; }", -1, NULL);
+            gtk_style_context_add_provider_for_screen(gdk_screen_get_default(), GTK_STYLE_PROVIDER(gcss),
+                                                      GTK_STYLE_PROVIDER_PRIORITY_USER + 130);
         }
     }
     gtk_widget_show_all(gtk_bin_get_child(GTK_BIN(ui->popup_win)));
@@ -3843,7 +5561,7 @@ static void on_start_btn_toggled(GtkToggleButton *btn, StartMenuUI *ui) {
     }
     if (ui->popup_win) {
         g_object_set_data(G_OBJECT(ui->popup_win), "dock-anchor-btn", NULL);
-        if (ui->shell->start_style == START_STYLE_FULLSCREEN && gtk_toggle_button_get_active(btn)) {
+        if (sm_style_fullscreen(ui->shell) && gtk_toggle_button_get_active(btn)) {
             GdkRectangle fs_rect;
             compute_fullscreen_menu_workarea(ui, &fs_rect);
             gtk_widget_set_size_request(ui->popup_win, fs_rect.width, fs_rect.height);
@@ -3862,11 +5580,19 @@ static void on_start_btn_toggled(GtkToggleButton *btn, StartMenuUI *ui) {
 static void position_popup_above_dock_anchor(GtkWidget *popup_win, GtkWidget *anchor_btn) {
     if (!popup_win || !anchor_btn || !gtk_widget_get_window(anchor_btn)) return;
 
-    gint st = (g_start_ui && g_start_ui->shell) ? CLAMP((gint)g_start_ui->shell->start_style, 0, 4) : 0;
+    gint st = (g_start_ui && g_start_ui->shell) ? CLAMP((gint)g_start_ui->shell->start_style, 0, START_STYLE_COUNT - 1) : 0;
     gint pw = (g_start_ui && g_start_ui->shell) ? CLAMP(g_start_ui->shell->start_style_w[st], 320, 1400) : 420;
     gint ph = (g_start_ui && g_start_ui->shell) ? CLAMP(g_start_ui->shell->start_style_h[st], 360, 1000) : 520;
+    /* place by the size the menu was really built at (the saved size can be outside these
+       limits, e.g. Classic at 350 x 470): otherwise its edge misses the dock / screen edge */
+    {
+        gint rw = -1, rh = -1;
+        gtk_widget_get_size_request(popup_win, &rw, &rh);
+        if (rw > 100) pw = rw;
+        if (rh > 100) ph = rh;
+    }
 
-    if (g_start_ui && g_start_ui->shell && g_start_ui->shell->start_style == START_STYLE_FULLSCREEN) {
+    if (g_start_ui && g_start_ui->shell && sm_style_fullscreen(g_start_ui->shell)) {
         GdkRectangle fs_rect;
         compute_fullscreen_menu_workarea(g_start_ui, &fs_rect);
         gtk_widget_set_size_request(popup_win, fs_rect.width, fs_rect.height);
@@ -3917,6 +5643,31 @@ static void on_dock_popup_size_allocate(GtkWidget *popup_win, GdkRectangle *allo
     }
 }
 
+/* Super key (xfce4-panel --plugin-event=ultimateshell:popup:bool:true): the same start menu the
+   button opens - from the Start button in Windows mode, from the dock's Show Apps / Launchpad
+   button in macOS and GNOME mode (the top-bar button there is the Apple menu / absent) */
+void start_menu_toggle_from_key(UltimateShell *shell) {
+    if (!shell || !g_start_ui || !g_start_ui->popup_win) return;
+    /* Pressing Super makes Keyboard Shortcuts grab the keyboard: the open menu loses focus and
+       hides itself just before this command arrives (it goes through a separate xfce4-panel
+       process). That hide was the "close" - don't open it again. */
+    if (!gtk_widget_get_visible(g_start_ui->popup_win)) {
+        gint64 *last = g_object_get_data(G_OBJECT(g_start_ui->popup_win), "last-focus-hide-us");
+        if (last && g_get_monotonic_time() - *last < 1200000) {
+            g_object_set_data(G_OBJECT(g_start_ui->popup_win), "last-focus-hide-us", NULL);
+            return;
+        }
+    }
+    if (shell->mode == LAYOUT_MACOS) {
+        start_menu_open_from_dock(shell, dock_window_launchpad_btn());
+        return;
+    }
+    if (GTK_IS_TOGGLE_BUTTON(g_start_ui->btn)) {
+        gboolean on = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(g_start_ui->btn));
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(g_start_ui->btn), !on);
+    }
+}
+
 void start_menu_open_from_dock(UltimateShell *shell, GtkWidget *anchor_btn) {
     if (!g_start_ui || !g_start_ui->popup_win) return;
     if (!g_object_get_data(G_OBJECT(g_start_ui->popup_win), "dock-alloc-connected")) {
@@ -3926,8 +5677,8 @@ void start_menu_open_from_dock(UltimateShell *shell, GtkWidget *anchor_btn) {
     }
 
     if (gtk_widget_get_visible(g_start_ui->popup_win)) {
+        shell_popup_hide(g_start_ui->popup_win);   /* before forgetting the dock anchor: Slide uses it */
         g_object_set_data(G_OBJECT(g_start_ui->popup_win), "dock-anchor-btn", NULL);
-        gtk_widget_hide(g_start_ui->popup_win);
         if (GTK_IS_TOGGLE_BUTTON(g_start_ui->btn)) {
             gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(g_start_ui->btn), FALSE);
         }
@@ -3942,6 +5693,7 @@ void start_menu_open_from_dock(UltimateShell *shell, GtkWidget *anchor_btn) {
             gtk_entry_set_text(GTK_ENTRY(g_start_ui->search_entry), "");
         }
         win11_reset_to_pinned(g_start_ui);
+        shell_popup_cancel_close(g_start_ui->popup_win);
         gtk_widget_show_all(g_start_ui->popup_win);
         if (anchor_btn) position_popup_above_dock_anchor(g_start_ui->popup_win, anchor_btn);
         gtk_window_present(GTK_WINDOW(g_start_ui->popup_win));
@@ -4136,9 +5888,10 @@ GtkWidget *start_menu_button_new(UltimateShell *shell) {
     ui->popup_win = shell_create_popup_window(btn, 360, 470, TRUE);
     g_object_set_data(G_OBJECT(ui->popup_win), "is-start-popup", GINT_TO_POINTER(1));
 
-    gtk_widget_add_events(ui->popup_win, GDK_SCROLL_MASK | GDK_SMOOTH_SCROLL_MASK | GDK_KEY_PRESS_MASK);
+    gtk_widget_add_events(ui->popup_win, GDK_SCROLL_MASK | GDK_SMOOTH_SCROLL_MASK | GDK_KEY_PRESS_MASK | GDK_KEY_RELEASE_MASK);
     g_signal_connect(ui->popup_win, "scroll-event", G_CALLBACK(on_fs_deck_scroll), ui);
     g_signal_connect(ui->popup_win, "key-press-event", G_CALLBACK(on_start_popup_key_press), ui);
+    g_signal_connect(ui->popup_win, "key-release-event", G_CALLBACK(on_start_popup_key_release), ui);
 
     start_menu_rebuild_style(shell);
     start_menu_update_button_appearance(shell);
