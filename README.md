@@ -13,6 +13,9 @@ desktop shell, in three styles you can switch between at any time:
 
 > **Status: beta (0.4.1).** It is used daily and tested on XFCE 4.20 / Debian, but expect
 > rough edges. X11 only — Wayland is not supported.
+>
+> **How this is made:** I started the project and wrote the first code; it's since been
+> developed with AI assistants (Gemini, then Claude). I design and test everything myself.
 
 | macOS layout | Windows layout |
 |---|---|
